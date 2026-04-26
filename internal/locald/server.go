@@ -28,7 +28,7 @@ import (
 type Server struct {
 	Addr             string
 	SchedulerAddr    string // gRPC addr of scheduler, e.g. "127.0.0.1:8336"
-	CacheAddr        string // optional external cache HTTP addr (unused for now)
+	CacheAddr        string // optional gRPC addr of yadcc-cache, e.g. "127.0.0.1:8338"
 	MaxLocalParallel int
 
 	once            sync.Once
@@ -37,6 +37,8 @@ type Server struct {
 	sem             chan struct{}
 	schedulerConn   *grpc.ClientConn
 	schedulerClient pb.SchedulerServiceClient
+	cacheConn       *grpc.ClientConn
+	cacheClient     pb.CacheServiceClient // nil when no external cache configured
 }
 
 type compileResult struct {
@@ -81,6 +83,22 @@ func (s *Server) init() {
 			} else {
 				s.schedulerConn = conn
 				s.schedulerClient = pb.NewSchedulerServiceClient(conn)
+			}
+		}
+
+		if s.CacheAddr != "" {
+			conn, err := grpc.NewClient(s.CacheAddr,
+				grpc.WithInsecure(), //nolint:staticcheck
+				grpc.WithDefaultCallOptions(
+					grpc.MaxCallRecvMsgSize(256<<20),
+					grpc.MaxCallSendMsgSize(256<<20),
+				))
+			if err != nil {
+				slog.Warn("locald: failed to connect to external cache", "error", err)
+			} else {
+				s.cacheConn = conn
+				s.cacheClient = pb.NewCacheServiceClient(conn)
+				slog.Info("locald: connected to external cache", "addr", s.CacheAddr)
 			}
 		}
 	})
@@ -140,36 +158,78 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// execute: cache -> remote gRPC -> local fallback.
+// execute: L1 memory cache -> external gRPC cache -> remote gRPC -> local fallback.
 func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, error) {
+	// L1: in-process memory cache.
 	if cached, err := s.store.Get(cacheKey); err == nil {
-		slog.Debug("locald: cache hit", "key", cacheKey)
+		slog.Debug("locald: L1 cache hit", "key", cacheKey)
 		return compileResult{ExitCode: 0, ObjectFile: cached, CacheHit: true}, nil
 	}
 
-	if s.schedulerClient != nil {
-		if result, err := s.tryRemoteGRPC(req); err == nil {
-			if result.ExitCode == 0 && len(result.ObjectFile) > 0 {
-				if putErr := s.store.Put(cacheKey, result.ObjectFile); putErr != nil {
-					slog.Warn("locald: cache put failed", "error", putErr)
-				}
-			}
-			return result, nil
-		} else {
-			slog.Debug("locald: remote failed, falling back to local", "error", err)
+	// L2: external gRPC cache.
+	if s.cacheClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		resp, err := s.cacheClient.TryGetEntry(ctx, &pb.TryGetEntryRequest{
+			Token: "locald",
+			Key:   cacheKey,
+		})
+		cancel()
+		if err == nil && len(resp.Value) > 0 {
+			slog.Debug("locald: L2 cache hit", "key", cacheKey)
+			_ = s.store.Put(cacheKey, resp.Value) // populate L1
+			return compileResult{ExitCode: 0, ObjectFile: resp.Value, CacheHit: true}, nil
 		}
 	}
 
-	return s.localCompile(req)
+	var result compileResult
+	var err error
+
+	if s.schedulerClient != nil {
+		result, err = s.tryRemoteGRPC(req)
+		if err != nil {
+			slog.Warn("locald: remote failed, falling back to local", "error", err)
+		}
+	}
+	if err != nil || s.schedulerClient == nil {
+		result, err = s.localCompile(req)
+		if err != nil {
+			return compileResult{}, err
+		}
+	}
+
+	// Store successful result in L1 and (asynchronously) L2.
+	if result.ExitCode == 0 && len(result.ObjectFile) > 0 {
+		if putErr := s.store.Put(cacheKey, result.ObjectFile); putErr != nil {
+			slog.Warn("locald: L1 cache put failed", "error", putErr)
+		}
+		if s.cacheClient != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_, _ = s.cacheClient.PutEntry(ctx, &pb.PutEntryRequest{
+					Token: "locald",
+					Key:   cacheKey,
+					Value: result.ObjectFile,
+				})
+			}()
+		}
+	}
+
+	return result, nil
 }
 
 // tryRemoteGRPC acquires a worker grant and dispatches compilation.
 func (s *Server) tryRemoteGRPC(req SubmitRequest) (compileResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Give the scheduler up to 5 s to find an available worker before we
+	// fall back to local compilation.  The gRPC context deadline must be
+	// longer than MillisecondsToWait so the RPC itself doesn't time out first.
+	const waitForWorkerMs = 5_000
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
 	grantResp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
-		ImmediateRequests: 1,
+		ImmediateRequests:  1,
+		MillisecondsToWait: waitForWorkerMs,
 	})
 	if err != nil {
 		return compileResult{}, fmt.Errorf("acquire worker: %w", err)

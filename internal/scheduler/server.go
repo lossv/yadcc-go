@@ -50,21 +50,28 @@ type Server struct {
 	// Leave empty to disable.
 	HTTPAddr string
 
-	mu      sync.Mutex
-	cond    *sync.Cond // broadcast when worker state changes
-	workers map[string]*workerEntry
-	grants  map[uint64]*taskGrant
-	nextID  atomic.Uint64
+	initOnce sync.Once
+	mu       sync.Mutex
+	cond     *sync.Cond // broadcast when worker state changes
+	workers  map[string]*workerEntry
+	grants   map[uint64]*taskGrant
+	nextID   atomic.Uint64
+}
+
+// ensureInit initialises the maps and cond exactly once.  It is safe to call
+// concurrently and from test code that never calls ListenAndServe.
+func (s *Server) ensureInit() {
+	s.initOnce.Do(func() {
+		s.cond = sync.NewCond(&s.mu)
+		s.workers = make(map[string]*workerEntry)
+		s.grants = make(map[uint64]*taskGrant)
+	})
 }
 
 // ListenAndServe starts both the gRPC server and (if HTTPAddr set) the HTTP
 // debug server.  It blocks until the gRPC server stops.
 func (s *Server) ListenAndServe() error {
-	s.cond = sync.NewCond(&s.mu)
-	s.mu.Lock()
-	s.workers = make(map[string]*workerEntry)
-	s.grants = make(map[uint64]*taskGrant)
-	s.mu.Unlock()
+	s.ensureInit()
 
 	go s.evictLoop()
 
@@ -86,6 +93,7 @@ func (s *Server) ListenAndServe() error {
 
 // Heartbeat is called by remote workers to register themselves and report load.
 func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	s.ensureInit()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -124,6 +132,7 @@ func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 // milliseconds (honouring the gRPC context deadline) for a worker to free up,
 // then returns ResourceExhausted if still none available.
 func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartingTaskRequest) (*pb.WaitForStartingTaskResponse, error) {
+	s.ensureInit()
 	want := int(req.ImmediateRequests)
 	if want <= 0 {
 		want = 1
@@ -192,6 +201,7 @@ func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartin
 
 // KeepTaskAlive refreshes the keep-alive timestamp for the given grants.
 func (s *Server) KeepTaskAlive(_ context.Context, req *pb.KeepTaskAliveRequest) (*pb.KeepTaskAliveResponse, error) {
+	s.ensureInit()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -207,6 +217,7 @@ func (s *Server) KeepTaskAlive(_ context.Context, req *pb.KeepTaskAliveRequest) 
 
 // FreeTask releases the given task grants.
 func (s *Server) FreeTask(_ context.Context, req *pb.FreeTaskRequest) (*pb.FreeTaskResponse, error) {
+	s.ensureInit()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -261,6 +272,7 @@ func workerSupportsEnv(w *workerEntry, env *pb.EnvironmentDesc) bool {
 // evictLoop removes workers whose heartbeat has timed out and cleans up their
 // associated grants.
 func (s *Server) evictLoop() {
+	s.ensureInit()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {

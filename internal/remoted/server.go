@@ -15,6 +15,7 @@ import (
 
 	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
+	"yadcc-go/internal/compiler"
 	"yadcc-go/internal/compress"
 
 	"google.golang.org/grpc"
@@ -49,6 +50,7 @@ type Server struct {
 	mu     sync.Mutex
 	tasks  map[uint64]*taskRecord
 
+	environments    []*pb.EnvironmentDesc // advertised to scheduler; set at startup
 	schedulerConn   *grpc.ClientConn
 	schedulerClient pb.SchedulerServiceClient
 }
@@ -59,6 +61,10 @@ func (s *Server) ListenAndServe() error {
 		s.Capacity = 4
 	}
 	s.tasks = make(map[uint64]*taskRecord)
+
+	// Build the environment descriptor for this worker so the scheduler
+	// can match tasks that require a specific compiler.
+	s.environments = s.buildEnvironments()
 
 	if s.SchedulerAddr != "" {
 		if err := s.connectScheduler(); err != nil {
@@ -349,10 +355,34 @@ func (s *Server) sendHeartbeat() error {
 	s.mu.Unlock()
 
 	_, err := s.schedulerClient.Heartbeat(ctx, &pb.HeartbeatRequest{
-		Token:       s.WorkerID,
-		Location:    s.GRPCAddr,
-		Capacity:    s.Capacity,
-		CurrentLoad: load,
+		Token:        s.WorkerID,
+		Location:     s.GRPCAddr,
+		Capacity:     s.Capacity,
+		CurrentLoad:  load,
+		Environments: s.environments,
 	})
 	return err
+}
+
+// buildEnvironments probes the local compiler and returns the EnvironmentDesc
+// slice to advertise in heartbeats.  If the compiler binary cannot be hashed
+// (e.g. it is a shell wrapper), an entry with an empty digest is returned so
+// that the worker is still visible to the scheduler for digest-agnostic tasks.
+func (s *Server) buildEnvironments() []*pb.EnvironmentDesc {
+	bin := s.CompilerPath
+	if bin == "" {
+		bin = "cc"
+	}
+
+	digest, err := compiler.Digest(bin)
+	if err != nil {
+		slog.Warn("remoted: could not hash compiler binary; advertising empty digest",
+			"compiler", bin, "error", err)
+		digest = ""
+	}
+
+	env := &pb.EnvironmentDesc{
+		CompilerDigest: digest,
+	}
+	return []*pb.EnvironmentDesc{env}
 }
