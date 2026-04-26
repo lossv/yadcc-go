@@ -1,222 +1,222 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-const (
-	workerHeartbeatTimeout = 30 * time.Second
-)
+const workerHeartbeatTimeout = 30 * time.Second
 
-// Worker represents a registered remote compilation worker.
-type Worker struct {
-	ID           string    `json:"id"`
-	Addr         string    `json:"addr"`          // host:port
-	CompilerPath string    `json:"compiler_path"` // path to compiler on worker
-	Capacity     int       `json:"capacity"`      // max concurrent tasks
-	Running      int       `json:"running"`       // current running tasks
-	LastSeen     time.Time `json:"last_seen"`
+// workerEntry tracks a registered remote worker.
+type workerEntry struct {
+	id           string
+	location     string // "host:port" of the worker's gRPC endpoint
+	capacity     uint32
+	currentLoad  uint32
+	lastSeen     time.Time
+	environments []*pb.EnvironmentDesc
 }
 
-// Server is the scheduler HTTP server.
+// taskGrant tracks an issued task grant.
+type taskGrant struct {
+	id         uint64
+	workerID   string
+	issuedAt   time.Time
+	keepAlive  time.Time
+}
+
+// Server implements SchedulerServiceServer over gRPC, and also exposes a small
+// HTTP debug/healthz endpoint on a separate port.
 type Server struct {
-	Addr string
+	pb.UnimplementedSchedulerServiceServer
+
+	// GRPCAddr is the address the gRPC server listens on (e.g. "0.0.0.0:8336").
+	GRPCAddr string
+	// HTTPAddr is the optional debug/healthz HTTP address (e.g. "0.0.0.0:8337").
+	// Leave empty to disable.
+	HTTPAddr string
 
 	mu      sync.Mutex
-	workers map[string]*Worker // keyed by ID
+	workers map[string]*workerEntry
+	grants  map[uint64]*taskGrant
+	nextID  atomic.Uint64
 }
 
-// RegisterRequest is the JSON body for /scheduler/register.
-type RegisterRequest struct {
-	ID           string `json:"id"`
-	Addr         string `json:"addr"`
-	CompilerPath string `json:"compiler_path"`
-	Capacity     int    `json:"capacity"`
-}
-
-// HeartbeatRequest is the JSON body for /scheduler/heartbeat.
-type HeartbeatRequest struct {
-	ID      string `json:"id"`
-	Running int    `json:"running"`
-}
-
-// AcquireWorkerResponse is the JSON response for /scheduler/acquire_worker.
-type AcquireWorkerResponse struct {
-	WorkerAddr string `json:"worker_addr"`
-	TaskToken  string `json:"task_token"`
-}
-
+// ListenAndServe starts both the gRPC server and (if HTTPAddr set) the HTTP
+// debug server.  It blocks until the gRPC server stops.
 func (s *Server) ListenAndServe() error {
 	s.mu.Lock()
-	s.workers = make(map[string]*Worker)
+	s.workers = make(map[string]*workerEntry)
+	s.grants = make(map[uint64]*taskGrant)
 	s.mu.Unlock()
 
-	// Start background goroutine to evict stale workers.
 	go s.evictLoop()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealth)
-	mux.HandleFunc("/scheduler/state", s.handleState)
-	mux.HandleFunc("/scheduler/register", s.handleRegister)
-	mux.HandleFunc("/scheduler/heartbeat", s.handleHeartbeat)
-	mux.HandleFunc("/scheduler/acquire_worker", s.handleAcquireWorker)
-	mux.HandleFunc("/scheduler/release_worker", s.handleReleaseWorker)
-	return http.ListenAndServe(s.Addr, mux)
-}
-
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	workers := len(s.workers)
-	running := 0
-	for _, w := range s.workers {
-		running += w.Running
+	if s.HTTPAddr != "" {
+		go s.serveHTTP()
 	}
-	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"version":       buildinfo.String(),
-		"workers":       workers,
-		"running_tasks": running,
-	})
-}
 
-func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(r.Body)
+	lis, err := net.Listen("tcp", s.GRPCAddr)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return fmt.Errorf("scheduler: listen %s: %w", s.GRPCAddr, err)
 	}
-	var req RegisterRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.ID == "" || req.Addr == "" {
-		http.Error(w, "id and addr are required", http.StatusBadRequest)
-		return
-	}
-	if req.Capacity <= 0 {
-		req.Capacity = 4
-	}
-
-	s.mu.Lock()
-	s.workers[req.ID] = &Worker{
-		ID:           req.ID,
-		Addr:         req.Addr,
-		CompilerPath: req.CompilerPath,
-		Capacity:     req.Capacity,
-		LastSeen:     time.Now(),
-	}
-	s.mu.Unlock()
-
-	slog.Info("scheduler: worker registered", "id", req.ID, "addr", req.Addr, "capacity", req.Capacity)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "registered"})
+	gs := grpc.NewServer()
+	pb.RegisterSchedulerServiceServer(gs, s)
+	slog.Info("scheduler: gRPC server listening", "addr", s.GRPCAddr)
+	return gs.Serve(lis)
 }
 
-func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	var req HeartbeatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+// ---------- SchedulerServiceServer implementation ----------
 
+// Heartbeat is called by remote workers to register themselves and report load.
+func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	s.mu.Lock()
-	worker, ok := s.workers[req.ID]
-	if ok {
-		worker.LastSeen = time.Now()
-		worker.Running = req.Running
-	}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
+	w, ok := s.workers[req.Token]
 	if !ok {
-		http.Error(w, "worker not registered", http.StatusNotFound)
-		return
+		w = &workerEntry{id: req.Token}
+		s.workers[req.Token] = w
+		slog.Info("scheduler: worker registered via heartbeat", "id", req.Token, "location", req.Location)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
+	w.location = req.Location
+	w.capacity = req.Capacity
+	w.currentLoad = req.CurrentLoad
+	w.lastSeen = time.Now()
+	w.environments = req.Environments
 
-// handleAcquireWorker picks a worker with available capacity and reserves a slot.
-func (s *Server) handleAcquireWorker(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	worker := s.pickWorker()
-	if worker != nil {
-		worker.Running++
-	}
-	s.mu.Unlock()
-
-	if worker == nil {
-		http.Error(w, "no available workers", http.StatusServiceUnavailable)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, AcquireWorkerResponse{
-		WorkerAddr: worker.Addr,
-		TaskToken:  worker.ID, // simple token = worker ID for now
-	})
-}
-
-// handleReleaseWorker decrements a worker's running count.
-func (s *Server) handleReleaseWorker(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	workerID := r.URL.Query().Get("id")
-	if workerID == "" {
-		http.Error(w, "id is required", http.StatusBadRequest)
-		return
-	}
-
-	s.mu.Lock()
-	if worker, ok := s.workers[workerID]; ok {
-		if worker.Running > 0 {
-			worker.Running--
+	// Collect expired grant IDs to notify the worker.
+	var expired []uint64
+	for gid, g := range s.grants {
+		if g.workerID == req.Token && time.Since(g.keepAlive) > 2*time.Minute {
+			expired = append(expired, gid)
+			delete(s.grants, gid)
 		}
 	}
-	s.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	return &pb.HeartbeatResponse{
+		ExpiredTaskGrantIds: expired,
+	}, nil
 }
 
-// pickWorker selects a worker with available capacity using least-loaded strategy.
-// Must be called with s.mu held.
-func (s *Server) pickWorker() *Worker {
-	var best *Worker
+// WaitForStartingTask allocates task grants for a requester daemon.
+func (s *Server) WaitForStartingTask(_ context.Context, req *pb.WaitForStartingTaskRequest) (*pb.WaitForStartingTaskResponse, error) {
+	want := int(req.ImmediateRequests)
+	if want <= 0 {
+		want = 1
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var grants []*pb.StartingTaskGrant
+	for range want {
+		w := s.pickWorker(req.Environment)
+		if w == nil {
+			break
+		}
+		w.currentLoad++
+		id := s.nextID.Add(1)
+		s.grants[id] = &taskGrant{
+			id:        id,
+			workerID:  w.id,
+			issuedAt:  time.Now(),
+			keepAlive: time.Now(),
+		}
+		grants = append(grants, &pb.StartingTaskGrant{
+			TaskGrantId:     id,
+			ServantLocation: w.location,
+		})
+	}
+
+	if len(grants) == 0 {
+		return nil, status.Error(codes.ResourceExhausted, "no available workers")
+	}
+	return &pb.WaitForStartingTaskResponse{Grants: grants}, nil
+}
+
+// KeepTaskAlive refreshes the keep-alive timestamp for the given grants.
+func (s *Server) KeepTaskAlive(_ context.Context, req *pb.KeepTaskAliveRequest) (*pb.KeepTaskAliveResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	statuses := make([]bool, len(req.TaskGrantIds))
+	for i, gid := range req.TaskGrantIds {
+		if g, ok := s.grants[gid]; ok {
+			g.keepAlive = time.Now()
+			statuses[i] = true
+		}
+	}
+	return &pb.KeepTaskAliveResponse{Statuses: statuses}, nil
+}
+
+// FreeTask releases the given task grants.
+func (s *Server) FreeTask(_ context.Context, req *pb.FreeTaskRequest) (*pb.FreeTaskResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, gid := range req.TaskGrantIds {
+		if g, ok := s.grants[gid]; ok {
+			if w, ok := s.workers[g.workerID]; ok && w.currentLoad > 0 {
+				w.currentLoad--
+			}
+			delete(s.grants, gid)
+		}
+	}
+	return &pb.FreeTaskResponse{}, nil
+}
+
+// ---------- helpers ----------
+
+// pickWorker selects the least-loaded worker that supports the requested
+// environment.  Must be called with s.mu held.
+func (s *Server) pickWorker(env *pb.EnvironmentDesc) *workerEntry {
+	var best *workerEntry
 	for _, w := range s.workers {
-		if w.Running >= w.Capacity {
+		if w.currentLoad >= w.capacity {
 			continue
 		}
-		if best == nil || w.Running < best.Running {
+		if env != nil && !workerSupportsEnv(w, env) {
+			continue
+		}
+		if best == nil || w.currentLoad < best.currentLoad {
 			best = w
 		}
 	}
 	return best
 }
 
-// evictLoop removes workers that have not sent a heartbeat recently.
+// workerSupportsEnv checks whether the worker advertises the requested env.
+// When env is empty (zero-value), any worker is accepted.
+func workerSupportsEnv(w *workerEntry, env *pb.EnvironmentDesc) bool {
+	if env.CompilerDigest == "" {
+		return true
+	}
+	for _, e := range w.environments {
+		if e.CompilerDigest == env.CompilerDigest &&
+			(env.HostOs == "" || e.HostOs == env.HostOs) &&
+			(env.HostArch == "" || e.HostArch == env.HostArch) {
+			return true
+		}
+	}
+	return false
+}
+
+// evictLoop removes workers whose heartbeat has timed out.
 func (s *Server) evictLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -224,8 +224,8 @@ func (s *Server) evictLoop() {
 		s.mu.Lock()
 		now := time.Now()
 		for id, w := range s.workers {
-			if now.Sub(w.LastSeen) > workerHeartbeatTimeout {
-				slog.Info("scheduler: evicting stale worker", "id", id, "last_seen", w.LastSeen)
+			if now.Sub(w.lastSeen) > workerHeartbeatTimeout {
+				slog.Info("scheduler: evicting stale worker", "id", id)
 				delete(s.workers, id)
 			}
 		}
@@ -233,8 +233,30 @@ func (s *Server) evictLoop() {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// ---------- HTTP debug endpoint ----------
+
+func (s *Server) serveHTTP() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/scheduler/state", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		workers := len(s.workers)
+		grants := len(s.grants)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version":       buildinfo.String(),
+			"workers":       workers,
+			"running_tasks": grants,
+		})
+	})
+	slog.Info("scheduler: HTTP debug server listening", "addr", s.HTTPAddr)
+	_ = http.ListenAndServe(s.HTTPAddr, mux)
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }

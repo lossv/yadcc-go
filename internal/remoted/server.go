@@ -2,150 +2,209 @@ package remoted
 
 import (
 	"bytes"
-	"encoding/json"
-	"io"
+	"context"
+	"fmt"
 	"log/slog"
-	"net/http"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// Server is the remote compilation worker HTTP server.
+// taskRecord stores an in-flight or completed compilation task.
+type taskRecord struct {
+	mu     sync.Mutex
+	done   chan struct{} // closed when compilation finishes
+	result *pb.WaitForCompilationOutputResponse
+}
+
+// Server implements RemoteDaemonServiceServer and SchedulerService heartbeat.
 type Server struct {
-	Addr string
-	// SchedulerAddr is the scheduler to register with on startup.
+	pb.UnimplementedRemoteDaemonServiceServer
+
+	// GRPCAddr is the address this worker listens on (e.g. "0.0.0.0:8335").
+	GRPCAddr string
+	// SchedulerAddr is the gRPC address of the scheduler (e.g. "host:8336").
+	// Leave empty to skip registration.
 	SchedulerAddr string
-	// WorkerID uniquely identifies this worker.
+	// WorkerID uniquely identifies this worker instance.
 	WorkerID string
-	// CompilerPath is the absolute path to the compiler on this machine.
+	// CompilerPath is the local compiler binary to use for compilation.
 	CompilerPath string
-	// Capacity is the max number of concurrent compile tasks.
-	Capacity int
+	// Capacity is the maximum number of concurrent compile tasks.
+	Capacity uint32
+
+	nextID atomic.Uint64
+	mu     sync.Mutex
+	tasks  map[uint64]*taskRecord
+
+	schedulerConn   *grpc.ClientConn
+	schedulerClient pb.SchedulerServiceClient
 }
 
-// CompileRequest mirrors locald.remoteCompileRequest.
-type CompileRequest struct {
-	CompilerPath       string   `json:"compiler_path"`
-	Args               []string `json:"args"`
-	Language           string   `json:"language"`
-	PreprocessedSource []byte   `json:"preprocessed_source"`
-}
-
-// CompileResponse mirrors locald.remoteCompileResponse.
-type CompileResponse struct {
-	ExitCode   int    `json:"exit_code"`
-	Stdout     []byte `json:"stdout"`
-	Stderr     []byte `json:"stderr"`
-	ObjectFile []byte `json:"object_file"`
-}
-
-// registerRequest mirrors scheduler.RegisterRequest.
-type registerRequest struct {
-	ID           string `json:"id"`
-	Addr         string `json:"addr"`
-	CompilerPath string `json:"compiler_path"`
-	Capacity     int    `json:"capacity"`
-}
-
-// heartbeatRequest mirrors scheduler.HeartbeatRequest.
-type heartbeatRequest struct {
-	ID      string `json:"id"`
-	Running int    `json:"running"`
-}
-
+// ListenAndServe starts the gRPC server and registers with the scheduler.
 func (s *Server) ListenAndServe() error {
-	if s.Capacity <= 0 {
+	if s.Capacity == 0 {
 		s.Capacity = 4
 	}
+	s.tasks = make(map[uint64]*taskRecord)
 
-	// Register with scheduler.
 	if s.SchedulerAddr != "" {
-		if err := s.registerWithScheduler(); err != nil {
-			slog.Warn("remoted: failed to register with scheduler", "error", err)
+		if err := s.connectScheduler(); err != nil {
+			slog.Warn("remoted: failed to connect to scheduler", "error", err)
 		} else {
-			slog.Info("remoted: registered with scheduler", "id", s.WorkerID)
 			go s.heartbeatLoop()
 		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/remote/compile", s.handleCompile)
-	return http.ListenAndServe(s.Addr, mux)
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"version": buildinfo.String(),
-		"id":      s.WorkerID,
-	})
-}
-
-func (s *Server) handleCompile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 256<<20))
+	lis, err := net.Listen("tcp", s.GRPCAddr)
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
-		return
+		return fmt.Errorf("remoted: listen %s: %w", s.GRPCAddr, err)
 	}
-
-	var req CompileRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp := s.compile(req)
-	writeJSON(w, http.StatusOK, resp)
+	gs := grpc.NewServer(grpc.MaxRecvMsgSize(256 << 20))
+	pb.RegisterRemoteDaemonServiceServer(gs, s)
+	slog.Info("remoted: gRPC worker listening", "addr", s.GRPCAddr, "id", s.WorkerID,
+		"version", buildinfo.String())
+	return gs.Serve(lis)
 }
 
-// compile runs the actual compilation on the preprocessed source.
-func (s *Server) compile(req CompileRequest) CompileResponse {
-	// Write preprocessed source to a temp file.
+// ---------- RemoteDaemonServiceServer ----------
+
+// QueueCxxCompilationTask enqueues a compilation and returns a task ID
+// immediately (async execution).
+func (s *Server) QueueCxxCompilationTask(ctx context.Context, req *pb.QueueCxxCompilationTaskRequest) (*pb.QueueCxxCompilationTaskResponse, error) {
+	id := s.nextID.Add(1)
+	rec := &taskRecord{done: make(chan struct{})}
+
+	s.mu.Lock()
+	s.tasks[id] = rec
+	s.mu.Unlock()
+
+	go func() {
+		resp := s.runCompile(req)
+		rec.mu.Lock()
+		rec.result = resp
+		rec.mu.Unlock()
+		close(rec.done)
+	}()
+
+	return &pb.QueueCxxCompilationTaskResponse{TaskId: id}, nil
+}
+
+// ReferenceTask is a no-op reference bump (for future ref-counting).
+func (s *Server) ReferenceTask(_ context.Context, req *pb.ReferenceTaskRequest) (*pb.ReferenceTaskResponse, error) {
+	s.mu.Lock()
+	_, ok := s.tasks[req.TaskId]
+	s.mu.Unlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "task %d not found", req.TaskId)
+	}
+	return &pb.ReferenceTaskResponse{}, nil
+}
+
+// WaitForCompilationOutput polls for task completion.
+func (s *Server) WaitForCompilationOutput(_ context.Context, req *pb.WaitForCompilationOutputRequest) (*pb.WaitForCompilationOutputResponse, error) {
+	s.mu.Lock()
+	rec, ok := s.tasks[req.TaskId]
+	s.mu.Unlock()
+
+	if !ok {
+		return &pb.WaitForCompilationOutputResponse{
+			Status: pb.WaitForCompilationOutputResponse_STATUS_NOT_FOUND,
+		}, nil
+	}
+
+	timeout := time.Duration(req.MillisecondsToWait) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	select {
+	case <-rec.done:
+		rec.mu.Lock()
+		result := rec.result
+		rec.mu.Unlock()
+		return result, nil
+	case <-time.After(timeout):
+		return &pb.WaitForCompilationOutputResponse{
+			Status: pb.WaitForCompilationOutputResponse_STATUS_RUNNING,
+		}, nil
+	}
+}
+
+// FreeRemoteTask removes a completed task record.
+func (s *Server) FreeRemoteTask(_ context.Context, req *pb.FreeRemoteTaskRequest) (*pb.FreeRemoteTaskResponse, error) {
+	s.mu.Lock()
+	delete(s.tasks, req.TaskId)
+	s.mu.Unlock()
+	return &pb.FreeRemoteTaskResponse{}, nil
+}
+
+// ---------- compile logic ----------
+
+func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForCompilationOutputResponse {
+	env := req.Environment
+	lang := "c"
+	if env != nil && (env.CompilerKind == "clang" || env.CompilerKind == "gcc") {
+		// language info not in EnvironmentDesc — infer from source extension later
+	}
+	// Detect language from compiler_arguments.
+	for _, a := range req.CompilerArguments {
+		if a == "-x" {
+			// Next arg is the language; handled in loop below.
+		}
+	}
+	for i, a := range req.CompilerArguments {
+		if a == "-x" && i+1 < len(req.CompilerArguments) {
+			lang = req.CompilerArguments[i+1]
+			break
+		}
+	}
+
 	ext := ".i"
-	if req.Language == "c++" {
+	if strings.Contains(lang, "++") || strings.Contains(lang, "c++") {
 		ext = ".ii"
 	}
+
+	// Write preprocessed source to temp file.
 	tmpSrc, err := os.CreateTemp("", "yadcc-remote-*"+ext)
 	if err != nil {
-		return CompileResponse{ExitCode: 1, Stderr: []byte("create temp source: " + err.Error())}
+		return errResponse("create temp source: " + err.Error())
 	}
 	tmpSrcPath := tmpSrc.Name()
 	defer os.Remove(tmpSrcPath)
 
-	if _, err := tmpSrc.Write(req.PreprocessedSource); err != nil {
+	if _, err := tmpSrc.Write(req.ZstdPreprocessedSource); err != nil {
 		tmpSrc.Close()
-		return CompileResponse{ExitCode: 1, Stderr: []byte("write temp source: " + err.Error())}
+		return errResponse("write temp source: " + err.Error())
 	}
 	tmpSrc.Close()
 
-	// Create a temp file for the output .o
+	// Temp output file.
 	tmpOut, err := os.CreateTemp("", "yadcc-remote-*.o")
 	if err != nil {
-		return CompileResponse{ExitCode: 1, Stderr: []byte("create temp output: " + err.Error())}
+		return errResponse("create temp output: " + err.Error())
 	}
 	tmpOutPath := tmpOut.Name()
 	tmpOut.Close()
 	defer os.Remove(tmpOutPath)
 
-	// Determine which compiler binary to use.
 	compilerBin := s.CompilerPath
 	if compilerBin == "" {
-		compilerBin = req.CompilerPath
+		compilerBin = "cc"
 	}
 
-	// Build compile args from the original args, replacing input and output.
-	args := buildRemoteArgs(req.Args, tmpSrcPath, tmpOutPath)
-
+	args := buildCompileArgs(req.CompilerArguments, tmpSrcPath, tmpOutPath)
 	slog.Debug("remoted: running compiler", "compiler", compilerBin, "args", args)
 
 	var stdout, stderr bytes.Buffer
@@ -154,34 +213,36 @@ func (s *Server) compile(req CompileRequest) CompileResponse {
 	cmd.Stderr = &stderr
 	cmd.Env = os.Environ()
 
-	exitCode := 0
+	exitCode := int32(0)
 	if runErr := cmd.Run(); runErr != nil {
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
+			exitCode = int32(exitErr.ExitCode())
 		} else {
-			return CompileResponse{ExitCode: 1, Stderr: []byte("run compiler: " + runErr.Error())}
+			return errResponse("run compiler: " + runErr.Error())
 		}
 	}
 
-	var objBytes []byte
+	resp := &pb.WaitForCompilationOutputResponse{
+		Status:   pb.WaitForCompilationOutputResponse_STATUS_DONE,
+		ExitCode: exitCode,
+		Stdout:   stdout.Bytes(),
+		Stderr:   stderr.Bytes(),
+	}
+
 	if exitCode == 0 {
-		objBytes, err = os.ReadFile(tmpOutPath)
+		objBytes, err := os.ReadFile(tmpOutPath)
 		if err != nil {
-			slog.Warn("remoted: failed to read output file", "path", tmpOutPath, "error", err)
+			slog.Warn("remoted: failed to read output file", "error", err)
+		} else {
+			resp.Outputs = []*pb.FileBlob{{Name: "output.o", Data: objBytes}}
 		}
 	}
 
-	return CompileResponse{
-		ExitCode:   exitCode,
-		Stdout:     stdout.Bytes(),
-		Stderr:     stderr.Bytes(),
-		ObjectFile: objBytes,
-	}
+	return resp
 }
 
-// buildRemoteArgs builds compiler args for remote compilation, using tmpSrc as
-// input and tmpOut as output.
-func buildRemoteArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
+// buildCompileArgs adapts original args for real compilation from preprocessed src.
+func buildCompileArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 	skipNext := false
 	hasOutput := false
 	var args []string
@@ -192,8 +253,7 @@ func buildRemoteArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 			continue
 		}
 		if !strings.HasPrefix(a, "-") {
-			// input file — replaced by tmpSrc below
-			continue
+			continue // input file — replaced by tmpSrc
 		}
 		if a == "-o" {
 			if i+1 < len(originalArgs) {
@@ -203,11 +263,10 @@ func buildRemoteArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 			hasOutput = true
 			continue
 		}
-		// Drop preprocessing artifacts.
-		if a == "-E" || a == "-fdirectives-only" || a == "-MD" || a == "-MMD" || a == "-MP" || a == "-MG" {
+		switch a {
+		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
 			continue
-		}
-		if a == "-MF" || a == "-MT" || a == "-MQ" {
+		case "-MF", "-MT", "-MQ":
 			skipNext = true
 			continue
 		}
@@ -221,61 +280,50 @@ func buildRemoteArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 	return args
 }
 
-// registerWithScheduler sends a registration request to the scheduler.
-func (s *Server) registerWithScheduler() error {
-	req := registerRequest{
-		ID:           s.WorkerID,
-		Addr:         s.Addr,
-		CompilerPath: s.CompilerPath,
-		Capacity:     s.Capacity,
+func errResponse(msg string) *pb.WaitForCompilationOutputResponse {
+	return &pb.WaitForCompilationOutputResponse{
+		Status:   pb.WaitForCompilationOutputResponse_STATUS_DONE,
+		ExitCode: 1,
+		Stderr:   []byte(msg),
 	}
-	data, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(s.SchedulerAddr+"/scheduler/register", "application/json", bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return &httpError{code: resp.StatusCode, body: string(body)}
-	}
-	return nil
 }
 
-// heartbeatLoop periodically sends heartbeats to the scheduler.
+// ---------- scheduler registration / heartbeat ----------
+
+func (s *Server) connectScheduler() error {
+	conn, err := grpc.NewClient(s.SchedulerAddr, grpc.WithInsecure()) //nolint:staticcheck
+	if err != nil {
+		return err
+	}
+	s.schedulerConn = conn
+	s.schedulerClient = pb.NewSchedulerServiceClient(conn)
+	// Send first heartbeat immediately.
+	return s.sendHeartbeat()
+}
+
 func (s *Server) heartbeatLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	client := &http.Client{Timeout: 5 * time.Second}
 	for range ticker.C {
-		req := heartbeatRequest{ID: s.WorkerID}
-		data, _ := json.Marshal(req)
-		resp, err := client.Post(s.SchedulerAddr+"/scheduler/heartbeat", "application/json", bytes.NewReader(data))
-		if err != nil {
-			slog.Warn("remoted: heartbeat failed", "error", err)
-			// Try re-registering.
-			_ = s.registerWithScheduler()
-			continue
+		if err := s.sendHeartbeat(); err != nil {
+			slog.Warn("remoted: heartbeat error", "error", err)
 		}
-		resp.Body.Close()
 	}
 }
 
-type httpError struct {
-	code int
-	body string
-}
+func (s *Server) sendHeartbeat() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-func (e *httpError) Error() string {
-	return "http " + http.StatusText(e.code) + ": " + e.body
-}
+	s.mu.Lock()
+	load := uint32(len(s.tasks))
+	s.mu.Unlock()
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, err := s.schedulerClient.Heartbeat(ctx, &pb.HeartbeatRequest{
+		Token:       s.WorkerID,
+		Location:    s.GRPCAddr,
+		Capacity:    s.Capacity,
+		CurrentLoad: load,
+	})
+	return err
 }
