@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // PreprocessResult holds the result of a preprocessing run.
@@ -12,6 +13,9 @@ type PreprocessResult struct {
 	Source []byte
 	// Language as determined from the original args (e.g. "c", "c++").
 	Language string
+	// SourceDir is the directory of the original source file; used for
+	// path normalisation in NormalizePreprocessed.
+	SourceDir string
 }
 
 // Preprocess runs the C/C++ preprocessor for the given source file.
@@ -40,7 +44,8 @@ func Preprocess(compilerPath string, a Args) (PreprocessResult, error) {
 
 	// Try -fdirectives-only first.
 	if src, err := runPreprocessor(compilerPath, append(baseArgs, "-fdirectives-only")); err == nil {
-		return PreprocessResult{Source: src, Language: lang}, nil
+		src = NormalizePreprocessed(src, filepath.Dir(inputFile), a.Sysroot())
+		return PreprocessResult{Source: src, Language: lang, SourceDir: filepath.Dir(inputFile)}, nil
 	}
 
 	// Fall back to plain -E.
@@ -48,7 +53,8 @@ func Preprocess(compilerPath string, a Args) (PreprocessResult, error) {
 	if err != nil {
 		return PreprocessResult{}, fmt.Errorf("preprocessing failed: %w", err)
 	}
-	return PreprocessResult{Source: src, Language: lang}, nil
+	src = NormalizePreprocessed(src, filepath.Dir(inputFile), a.Sysroot())
+	return PreprocessResult{Source: src, Language: lang, SourceDir: filepath.Dir(inputFile)}, nil
 }
 
 // buildPreprocessArgs returns the argument list for a -E invocation based on

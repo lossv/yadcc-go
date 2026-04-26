@@ -12,6 +12,9 @@ service SchedulerService {
   rpc KeepTaskAlive(KeepTaskAliveRequest) returns (KeepTaskAliveResponse);
   rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
   rpc GetRunningTasks(GetRunningTasksRequest) returns (GetRunningTasksResponse);
+  // GetConfig allows daemons to pull dynamic cluster configuration (e.g.
+  // acceptable user tokens, servant capacity overrides).
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
 }
 
 message HeartbeatRequest {
@@ -88,4 +91,24 @@ message GetRunningTasksResponse {
   repeated RunningTaskInfo tasks = 1;
   // total_workers is the number of currently registered workers.
   uint32 total_workers = 2;
+}
+
+// GetConfigRequest is sent by daemons to pull dynamic cluster configuration.
+message GetConfigRequest {
+  string token = 1;
+}
+
+// GetConfigResponse carries cluster-wide dynamic configuration pushed by the
+// operator via the scheduler.
+message GetConfigResponse {
+  // max_local_parallel_tasks overrides the daemon's computed CPU-based limit
+  // for concurrent local compilations.  0 means "use default".
+  uint32 max_local_parallel_tasks = 1;
+  // max_servant_tasks overrides the daemon's servant capacity.  0 = default.
+  uint32 max_servant_tasks = 2;
+  // acceptable_user_tokens is the current token whitelist for user RPCs.
+  // Empty means accept all.
+  repeated string acceptable_user_tokens = 3;
+  // acceptable_servant_tokens is the current token whitelist for servant RPCs.
+  repeated string acceptable_servant_tokens = 4;
 }

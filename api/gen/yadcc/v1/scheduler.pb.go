@@ -711,6 +711,127 @@ func (x *GetRunningTasksResponse) GetTotalWorkers() uint32 {
 	return 0
 }
 
+// GetConfigRequest is sent by daemons to pull dynamic cluster configuration.
+type GetConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetConfigRequest) Reset() {
+	*x = GetConfigRequest{}
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetConfigRequest) ProtoMessage() {}
+
+func (x *GetConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetConfigRequest.ProtoReflect.Descriptor instead.
+func (*GetConfigRequest) Descriptor() ([]byte, []int) {
+	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetConfigRequest) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+// GetConfigResponse carries cluster-wide dynamic configuration pushed by the
+// operator via the scheduler.
+type GetConfigResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// max_local_parallel_tasks overrides the daemon's computed CPU-based limit
+	// for concurrent local compilations.  0 means "use default".
+	MaxLocalParallelTasks uint32 `protobuf:"varint,1,opt,name=max_local_parallel_tasks,json=maxLocalParallelTasks,proto3" json:"max_local_parallel_tasks,omitempty"`
+	// max_servant_tasks overrides the daemon's servant capacity.  0 = default.
+	MaxServantTasks uint32 `protobuf:"varint,2,opt,name=max_servant_tasks,json=maxServantTasks,proto3" json:"max_servant_tasks,omitempty"`
+	// acceptable_user_tokens is the current token whitelist for user RPCs.
+	// Empty means accept all.
+	AcceptableUserTokens []string `protobuf:"bytes,3,rep,name=acceptable_user_tokens,json=acceptableUserTokens,proto3" json:"acceptable_user_tokens,omitempty"`
+	// acceptable_servant_tokens is the current token whitelist for servant RPCs.
+	AcceptableServantTokens []string `protobuf:"bytes,4,rep,name=acceptable_servant_tokens,json=acceptableServantTokens,proto3" json:"acceptable_servant_tokens,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *GetConfigResponse) Reset() {
+	*x = GetConfigResponse{}
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetConfigResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetConfigResponse) ProtoMessage() {}
+
+func (x *GetConfigResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetConfigResponse.ProtoReflect.Descriptor instead.
+func (*GetConfigResponse) Descriptor() ([]byte, []int) {
+	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GetConfigResponse) GetMaxLocalParallelTasks() uint32 {
+	if x != nil {
+		return x.MaxLocalParallelTasks
+	}
+	return 0
+}
+
+func (x *GetConfigResponse) GetMaxServantTasks() uint32 {
+	if x != nil {
+		return x.MaxServantTasks
+	}
+	return 0
+}
+
+func (x *GetConfigResponse) GetAcceptableUserTokens() []string {
+	if x != nil {
+		return x.AcceptableUserTokens
+	}
+	return nil
+}
+
+func (x *GetConfigResponse) GetAcceptableServantTokens() []string {
+	if x != nil {
+		return x.AcceptableServantTokens
+	}
+	return nil
+}
+
 var File_yadcc_v1_scheduler_proto protoreflect.FileDescriptor
 
 const file_yadcc_v1_scheduler_proto_rawDesc = "" +
@@ -759,13 +880,21 @@ const file_yadcc_v1_scheduler_proto_rawDesc = "" +
 	"ageSeconds\"o\n" +
 	"\x17GetRunningTasksResponse\x12/\n" +
 	"\x05tasks\x18\x01 \x03(\v2\x19.yadcc.v1.RunningTaskInfoR\x05tasks\x12#\n" +
-	"\rtotal_workers\x18\x02 \x01(\rR\ftotalWorkers2\xa9\x03\n" +
+	"\rtotal_workers\x18\x02 \x01(\rR\ftotalWorkers\"(\n" +
+	"\x10GetConfigRequest\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\"\xea\x01\n" +
+	"\x11GetConfigResponse\x127\n" +
+	"\x18max_local_parallel_tasks\x18\x01 \x01(\rR\x15maxLocalParallelTasks\x12*\n" +
+	"\x11max_servant_tasks\x18\x02 \x01(\rR\x0fmaxServantTasks\x124\n" +
+	"\x16acceptable_user_tokens\x18\x03 \x03(\tR\x14acceptableUserTokens\x12:\n" +
+	"\x19acceptable_servant_tokens\x18\x04 \x03(\tR\x17acceptableServantTokens2\xef\x03\n" +
 	"\x10SchedulerService\x12D\n" +
 	"\tHeartbeat\x12\x1a.yadcc.v1.HeartbeatRequest\x1a\x1b.yadcc.v1.HeartbeatResponse\x12b\n" +
 	"\x13WaitForStartingTask\x12$.yadcc.v1.WaitForStartingTaskRequest\x1a%.yadcc.v1.WaitForStartingTaskResponse\x12P\n" +
 	"\rKeepTaskAlive\x12\x1e.yadcc.v1.KeepTaskAliveRequest\x1a\x1f.yadcc.v1.KeepTaskAliveResponse\x12A\n" +
 	"\bFreeTask\x12\x19.yadcc.v1.FreeTaskRequest\x1a\x1a.yadcc.v1.FreeTaskResponse\x12V\n" +
-	"\x0fGetRunningTasks\x12 .yadcc.v1.GetRunningTasksRequest\x1a!.yadcc.v1.GetRunningTasksResponseB#Z!yadcc-go/api/gen/yadcc/v1;yadccv1b\x06proto3"
+	"\x0fGetRunningTasks\x12 .yadcc.v1.GetRunningTasksRequest\x1a!.yadcc.v1.GetRunningTasksResponse\x12D\n" +
+	"\tGetConfig\x12\x1a.yadcc.v1.GetConfigRequest\x1a\x1b.yadcc.v1.GetConfigResponseB#Z!yadcc-go/api/gen/yadcc/v1;yadccv1b\x06proto3"
 
 var (
 	file_yadcc_v1_scheduler_proto_rawDescOnce sync.Once
@@ -779,7 +908,7 @@ func file_yadcc_v1_scheduler_proto_rawDescGZIP() []byte {
 	return file_yadcc_v1_scheduler_proto_rawDescData
 }
 
-var file_yadcc_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_yadcc_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_yadcc_v1_scheduler_proto_goTypes = []any{
 	(*HeartbeatRequest)(nil),            // 0: yadcc.v1.HeartbeatRequest
 	(*HeartbeatResponse)(nil),           // 1: yadcc.v1.HeartbeatResponse
@@ -793,11 +922,13 @@ var file_yadcc_v1_scheduler_proto_goTypes = []any{
 	(*GetRunningTasksRequest)(nil),      // 9: yadcc.v1.GetRunningTasksRequest
 	(*RunningTaskInfo)(nil),             // 10: yadcc.v1.RunningTaskInfo
 	(*GetRunningTasksResponse)(nil),     // 11: yadcc.v1.GetRunningTasksResponse
-	(*EnvironmentDesc)(nil),             // 12: yadcc.v1.EnvironmentDesc
+	(*GetConfigRequest)(nil),            // 12: yadcc.v1.GetConfigRequest
+	(*GetConfigResponse)(nil),           // 13: yadcc.v1.GetConfigResponse
+	(*EnvironmentDesc)(nil),             // 14: yadcc.v1.EnvironmentDesc
 }
 var file_yadcc_v1_scheduler_proto_depIdxs = []int32{
-	12, // 0: yadcc.v1.HeartbeatRequest.environments:type_name -> yadcc.v1.EnvironmentDesc
-	12, // 1: yadcc.v1.WaitForStartingTaskRequest.environment:type_name -> yadcc.v1.EnvironmentDesc
+	14, // 0: yadcc.v1.HeartbeatRequest.environments:type_name -> yadcc.v1.EnvironmentDesc
+	14, // 1: yadcc.v1.WaitForStartingTaskRequest.environment:type_name -> yadcc.v1.EnvironmentDesc
 	3,  // 2: yadcc.v1.WaitForStartingTaskResponse.grants:type_name -> yadcc.v1.StartingTaskGrant
 	10, // 3: yadcc.v1.GetRunningTasksResponse.tasks:type_name -> yadcc.v1.RunningTaskInfo
 	0,  // 4: yadcc.v1.SchedulerService.Heartbeat:input_type -> yadcc.v1.HeartbeatRequest
@@ -805,13 +936,15 @@ var file_yadcc_v1_scheduler_proto_depIdxs = []int32{
 	5,  // 6: yadcc.v1.SchedulerService.KeepTaskAlive:input_type -> yadcc.v1.KeepTaskAliveRequest
 	7,  // 7: yadcc.v1.SchedulerService.FreeTask:input_type -> yadcc.v1.FreeTaskRequest
 	9,  // 8: yadcc.v1.SchedulerService.GetRunningTasks:input_type -> yadcc.v1.GetRunningTasksRequest
-	1,  // 9: yadcc.v1.SchedulerService.Heartbeat:output_type -> yadcc.v1.HeartbeatResponse
-	4,  // 10: yadcc.v1.SchedulerService.WaitForStartingTask:output_type -> yadcc.v1.WaitForStartingTaskResponse
-	6,  // 11: yadcc.v1.SchedulerService.KeepTaskAlive:output_type -> yadcc.v1.KeepTaskAliveResponse
-	8,  // 12: yadcc.v1.SchedulerService.FreeTask:output_type -> yadcc.v1.FreeTaskResponse
-	11, // 13: yadcc.v1.SchedulerService.GetRunningTasks:output_type -> yadcc.v1.GetRunningTasksResponse
-	9,  // [9:14] is the sub-list for method output_type
-	4,  // [4:9] is the sub-list for method input_type
+	12, // 9: yadcc.v1.SchedulerService.GetConfig:input_type -> yadcc.v1.GetConfigRequest
+	1,  // 10: yadcc.v1.SchedulerService.Heartbeat:output_type -> yadcc.v1.HeartbeatResponse
+	4,  // 11: yadcc.v1.SchedulerService.WaitForStartingTask:output_type -> yadcc.v1.WaitForStartingTaskResponse
+	6,  // 12: yadcc.v1.SchedulerService.KeepTaskAlive:output_type -> yadcc.v1.KeepTaskAliveResponse
+	8,  // 13: yadcc.v1.SchedulerService.FreeTask:output_type -> yadcc.v1.FreeTaskResponse
+	11, // 14: yadcc.v1.SchedulerService.GetRunningTasks:output_type -> yadcc.v1.GetRunningTasksResponse
+	13, // 15: yadcc.v1.SchedulerService.GetConfig:output_type -> yadcc.v1.GetConfigResponse
+	10, // [10:16] is the sub-list for method output_type
+	4,  // [4:10] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -829,7 +962,7 @@ func file_yadcc_v1_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_yadcc_v1_scheduler_proto_rawDesc), len(file_yadcc_v1_scheduler_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

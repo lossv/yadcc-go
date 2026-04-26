@@ -37,6 +37,7 @@ import (
 	"time"
 
 	pb "yadcc-go/api/gen/yadcc/v1"
+	"yadcc-go/internal/auth"
 	"yadcc-go/internal/buildinfo"
 	"yadcc-go/internal/cache"
 	"yadcc-go/internal/compiler"
@@ -78,8 +79,14 @@ type Server struct {
 	// CacheAddr is the optional gRPC address of the yadcc-cache service.
 	// Leave empty to use only the in-process L1 memory cache.
 	CacheAddr string
-	// Token is the authentication token for scheduler and cache.
+	// Token is the authentication token sent to scheduler and cache.
 	Token string
+	// UserTokens is the whitelist of accepted user tokens (from wrappers).
+	// Empty means accept all (open mode).
+	UserTokens []string
+	// ServantTokens is the whitelist of accepted servant tokens (from remote workers).
+	// Empty means accept all (open mode).
+	ServantTokens []string
 	// ServantPriority controls how many CPUs are given to remote tasks.
 	ServantPriority ServantPriority
 	// WorkerID uniquely identifies this daemon (defaults to hostname:port).
@@ -103,6 +110,7 @@ type Server struct {
 	bloomMu        sync.RWMutex
 	bloomFilter    *cache.BloomFilter // may be nil if no external cache
 	bloomLastFetch time.Time
+	verifier       auth.Verifier
 
 	// --- servant (gRPC) side ---
 	pb.UnimplementedRemoteDaemonServiceServer
@@ -117,6 +125,7 @@ type compileResult struct {
 	Stdout     []byte
 	Stderr     []byte
 	ObjectFile []byte
+	Outputs    []*pb.FileBlob
 	CacheHit   bool
 }
 
@@ -137,6 +146,9 @@ type SubmitRequest struct {
 	// It is used for path-rewriting in remote object files so debug info
 	// points to the correct local path rather than the remote temp file.
 	SourcePath string `json:"source_path,omitempty"`
+	// Token is the authentication token presented by the wrapper.
+	// The daemon validates it against the configured UserTokens whitelist.
+	Token string `json:"token,omitempty"`
 }
 
 // SubmitResponse is the JSON response to the wrapper.
@@ -169,6 +181,10 @@ func (s *Server) init() {
 		s.sem = make(chan struct{}, s.maxLocalParallel())
 		// Semaphore for preprocessing (P1-7): at most NumCPU concurrent.
 		s.ppSem = make(chan struct{}, runtime.NumCPU())
+
+		// Configure token auth.
+		s.verifier.SetUserTokens(s.UserTokens)
+		s.verifier.SetServantTokens(s.ServantTokens)
 
 		// In-process L1 cache.
 		s.store = cache.NewMemoryStore()
@@ -232,6 +248,7 @@ func (s *Server) ListenAndServe() error {
 			slog.Warn("daemon: initial heartbeat failed", "error", err)
 		}
 		go s.heartbeatLoop()
+		go s.configKeeperLoop()
 	}
 
 	// Serve the local HTTP API (wrapper-facing).
@@ -284,6 +301,16 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	var req SubmitRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Verify user token.  Fall back to X-Yadcc-Token header if body omits it.
+	tok := req.Token
+	if tok == "" {
+		tok = r.Header.Get("X-Yadcc-Token")
+	}
+	if !s.verifier.VerifyUser(tok) {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
 
@@ -345,7 +372,9 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 				metrics.DaemonTasksTotal.WithLabelValues("cache_hit_l1").Inc()
 				return compileResult{
 					ExitCode: int(entry.ExitCode), Stdout: entry.Stdout,
-					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile, CacheHit: true,
+					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile,
+					Outputs:  []*pb.FileBlob{{Name: "output.o", Data: entry.ObjectFile}},
+					CacheHit: true,
 				}, nil
 			}
 		}
@@ -366,7 +395,9 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 				_ = s.store.Put(cacheKey, resp.Value)
 				return compileResult{
 					ExitCode: int(entry.ExitCode), Stdout: entry.Stdout,
-					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile, CacheHit: true,
+					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile,
+					Outputs:  []*pb.FileBlob{{Name: "output.o", Data: entry.ObjectFile}},
+					CacheHit: true,
 				}, nil
 			}
 		}
@@ -424,7 +455,24 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 }
 
 // tryRemote acquires a worker grant from the scheduler and dispatches the task.
+// On worker failure it retries up to maxRemoteRetries times before giving up.
 func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
+	const maxRemoteRetries = 2
+	var lastErr error
+	for attempt := 0; attempt <= maxRemoteRetries; attempt++ {
+		result, err := s.tryRemoteOnce(req)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		slog.Debug("daemon: remote attempt failed, retrying",
+			"attempt", attempt+1, "max", maxRemoteRetries+1, "error", err)
+	}
+	return compileResult{}, fmt.Errorf("remote compile failed after %d attempts: %w", maxRemoteRetries+1, lastErr)
+}
+
+// tryRemoteOnce performs a single attempt to compile remotely.
+func (s *Server) tryRemoteOnce(req SubmitRequest) (compileResult, error) {
 	const waitForWorkerMs = 5_000
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -509,15 +557,13 @@ func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
 				Token: s.token(), TaskId: queueResp.TaskId,
 			})
 			freeCancel()
-			var obj []byte
-			if len(waitResp.Outputs) > 0 {
-				obj = waitResp.Outputs[0].Data
-			}
+			obj := primaryObject(waitResp.Outputs)
 			return compileResult{
 				ExitCode:   int(waitResp.ExitCode),
 				Stdout:     waitResp.Stdout,
 				Stderr:     waitResp.Stderr,
 				ObjectFile: obj,
+				Outputs:    waitResp.Outputs,
 			}, nil
 		}
 	}
@@ -605,12 +651,16 @@ func (s *Server) localCompile(req SubmitRequest) (compileResult, error) {
 	return compileResult{
 		ExitCode: exitCode, Stdout: outBuf.Bytes(),
 		Stderr: errBuf.Bytes(), ObjectFile: obj,
+		Outputs: []*pb.FileBlob{{Name: "output.o", Data: obj}},
 	}, nil
 }
 
 // ---------- servant gRPC (RemoteDaemonServiceServer) ----------
 
 func (s *Server) QueueCxxCompilationTask(_ context.Context, req *pb.QueueCxxCompilationTaskRequest) (*pb.QueueCxxCompilationTaskResponse, error) {
+	if !s.verifier.VerifyAny(req.Token) {
+		return nil, status.Error(codes.Unauthenticated, "invalid token")
+	}
 	// Enforce capacity limit — reject immediately if all slots are taken.
 	select {
 	case s.servantSem <- struct{}{}:
@@ -680,6 +730,7 @@ func (s *Server) FreeRemoteTask(_ context.Context, req *pb.FreeRemoteTaskRequest
 }
 
 // runCompile executes a compilation on behalf of a remote caller.
+// On success, the result is asynchronously written to the distributed cache.
 func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForCompilationOutputResponse {
 	// Decompress preprocessed source.
 	srcBytes, err := compress.Decompress(req.ZstdPreprocessedSource)
@@ -710,13 +761,12 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 	}
 	tmpSrc.Close()
 
-	tmpOut, err := os.CreateTemp("", "yadcc-remote-*.o")
+	outputDir, err := os.MkdirTemp("", "yadcc-remote-out-*")
 	if err != nil {
-		return errResp("create temp out: " + err.Error())
+		return errResp("create temp output dir: " + err.Error())
 	}
-	tmpOutPath := tmpOut.Name()
-	tmpOut.Close()
-	defer os.Remove(tmpOutPath)
+	defer os.RemoveAll(outputDir)
+	tmpOutPath := filepath.Join(outputDir, "output.o")
 
 	args := buildCompileArgs(req.CompilerArguments, tmpSrcPath, tmpOutPath)
 
@@ -742,16 +792,64 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 		Stderr:   stderr.Bytes(),
 	}
 	if exitCode == 0 {
-		if obj, err := os.ReadFile(tmpOutPath); err == nil {
-			// Patch the remote temp source path back to the expected local path
-			// so debug info / __FILE__ expansions point to the right location.
-			if req.SourcePath != "" {
-				obj = objpatch.Patch(obj, tmpSrcPath, req.SourcePath)
-			}
-			resp.Outputs = []*pb.FileBlob{{Name: "output.o", Data: obj}}
+		outputs, err := collectOutputs(outputDir, tmpSrcPath, req.SourcePath)
+		if err != nil {
+			return errResp("collect outputs: " + err.Error())
+		}
+		resp.Outputs = outputs
+
+		// P0-3: Servant-side async cache write-back (distributed_cache_writer).
+		// Build a cache key from the request and write the result to the
+		// distributed cache so other daemons can benefit without recompiling.
+		if s.cacheClient != nil && req.Environment != nil {
+			go s.servantWriteCache(req, resp)
 		}
 	}
 	return resp
+}
+
+func primaryObject(outputs []*pb.FileBlob) []byte {
+	for _, out := range outputs {
+		if out.Name == "output.o" || strings.HasSuffix(out.Name, ".o") || strings.HasSuffix(out.Name, ".obj") {
+			return out.Data
+		}
+	}
+	if len(outputs) > 0 {
+		return outputs[0].Data
+	}
+	return nil
+}
+
+func collectOutputs(root, remotePath, localPath string) ([]*pb.FileBlob, error) {
+	var outputs []*pb.FileBlob
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if localPath != "" {
+			data = objpatch.Patch(data, remotePath, localPath)
+		}
+		name, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		outputs = append(outputs, &pb.FileBlob{
+			Name: filepath.ToSlash(name),
+			Data: data,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return outputs, nil
 }
 
 // resolveCompilerForRequest finds the local compiler binary to use for a
@@ -878,6 +976,61 @@ func (s *Server) heartbeatLoop() {
 			slog.Warn("daemon: heartbeat error", "error", err)
 		}
 	}
+}
+
+// configKeeperLoop periodically pulls dynamic cluster configuration from the
+// scheduler (GetConfig RPC) and applies changes such as token whitelist updates
+// and capacity overrides.  This is the Go equivalent of config_keeper.cc.
+func (s *Server) configKeeperLoop() {
+	// Initial pull immediately, then every 60 seconds.
+	s.pullConfig()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.pullConfig()
+	}
+}
+
+func (s *Server) pullConfig() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := s.schedulerClient.GetConfig(ctx, &pb.GetConfigRequest{
+		Token: s.token(),
+	})
+	if err != nil {
+		slog.Debug("daemon: GetConfig failed", "error", err)
+		return
+	}
+
+	// Update token whitelist if the scheduler provides one.
+	if len(resp.AcceptableUserTokens) > 0 {
+		s.verifier.SetUserTokens(resp.AcceptableUserTokens)
+	}
+	if len(resp.AcceptableServantTokens) > 0 {
+		s.verifier.SetServantTokens(resp.AcceptableServantTokens)
+	}
+
+	// Update servant capacity if the scheduler overrides it.
+	if resp.MaxServantTasks > 0 {
+		newCap := int(resp.MaxServantTasks)
+		// Resize servantSem by draining and recreating.
+		// This is a best-effort update; in-flight tasks are not affected.
+		old := s.servantSem
+		s.servantSem = make(chan struct{}, newCap)
+		// Drain old semaphore tokens that were unused.
+		for {
+			select {
+			case <-old:
+			default:
+				goto done
+			}
+		}
+	done:
+		slog.Info("daemon: servant capacity updated from scheduler",
+			"capacity", newCap)
+	}
+	slog.Debug("daemon: config pulled from scheduler")
 }
 
 func (s *Server) sendHeartbeat() error {
@@ -1023,7 +1176,9 @@ func isCacheable(args []string, preprocessed []byte) bool {
 // It populates the full cache.KeyInput so that cross-environment collisions are
 // impossible (different target triple, sysroot, stdlib, or ABI → different key).
 func buildCacheKey(req SubmitRequest) string {
-	compilerDigest, err := compiler.Digest(req.CompilerPath)
+	// Use the per-process digest cache to avoid rehashing the compiler binary
+	// on every request (equivalent to C++ file_digest_cache.cc).
+	compilerDigest, err := compiler.DigestCached(req.CompilerPath)
 	if err != nil {
 		compilerDigest = req.CompilerPath
 	}
@@ -1210,4 +1365,74 @@ func isJoinedDependencyArg(arg string) bool {
 		}
 	}
 	return false
+}
+
+// servantWriteCache computes the cache key for a remotely-compiled task and
+// writes the result to the distributed cache server asynchronously.
+// This is the Go equivalent of C++ distributed_cache_writer.cc.
+func (s *Server) servantWriteCache(req *pb.QueueCxxCompilationTaskRequest, resp *pb.WaitForCompilationOutputResponse) {
+	// Decompress preprocessed source to compute source digest.
+	srcBytes, err := compress.Decompress(req.ZstdPreprocessedSource)
+	if err != nil {
+		slog.Debug("servant cache write: decompress failed", "error", err)
+		return
+	}
+
+	parsed := compiler.Parse(req.CompilerArguments)
+	sourceDigest := sha256.Sum256(srcBytes)
+
+	// Re-use the existing cache key construction logic.
+	compilerDigest := ""
+	if req.Environment != nil {
+		compilerDigest = req.Environment.CompilerDigest
+	}
+
+	input := cache.KeyInput{
+		CompilerDigest:           compilerDigest,
+		CompilerKind:             req.Environment.GetCompilerKind(),
+		CompilerVersion:          req.Environment.GetCompilerVersion(),
+		HostOS:                   req.Environment.GetHostOs(),
+		HostArch:                 req.Environment.GetHostArch(),
+		TargetTriple:             req.Environment.GetTargetTriple(),
+		ObjectFormat:             req.Environment.GetObjectFormat(),
+		ABI:                      req.Environment.GetAbi(),
+		SysrootDigest:            req.Environment.GetSysrootDigest(),
+		StdlibDigest:             req.Environment.GetStdlibDigest(),
+		NormalizedArguments:      normalizeArgs(req.CompilerArguments),
+		PreprocessedSourceDigest: hex.EncodeToString(sourceDigest[:]),
+		OutputKind:               "object",
+	}
+	_ = parsed // parsed used implicitly via normalizeArgs above
+	cacheKey := cache.BuildKey(input)
+
+	// Do not cache non-deterministic results (timestamp macros).
+	if !isCacheable(req.CompilerArguments, srcBytes) {
+		return
+	}
+
+	obj := primaryObject(resp.Outputs)
+	if len(obj) == 0 {
+		return
+	}
+
+	entryBytes := cache.MarshalEntry(cache.Entry{
+		ExitCode:   resp.ExitCode,
+		Stdout:     resp.Stdout,
+		Stderr:     resp.Stderr,
+		ObjectFile: obj,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = s.cacheClient.PutEntry(ctx, &pb.PutEntryRequest{
+		Token: s.token(),
+		Key:   cacheKey,
+		Value: entryBytes,
+	})
+	if err != nil {
+		slog.Debug("servant cache write: PutEntry failed", "error", err)
+	} else {
+		slog.Debug("servant cache write: stored result", "key", cacheKey[:8])
+		metrics.DaemonTasksTotal.WithLabelValues("servant_cache_write").Inc()
+	}
 }

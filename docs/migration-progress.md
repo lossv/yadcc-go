@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- 当前阶段：阶段 1 闭环已打通，阶段 2 大部分代码路径已接入。
+- 当前阶段：阶段 3 进行中（GetConfig/config_keeper、远程重试、动态容量、cgroup 内存感知 均已完成）。
 - 当前日期：2026-04-26。
-- 当前结论：wrapper -> daemon -> scheduler -> worker 核心链路已实现，可运行基本分布式编译闭环。L1 内存缓存、外部 L2 cache gRPC、Bloom Filter、taskgroup 去重、scheduler grant keep-alive、基础 metrics 均已接入。仍未达到 C++ 原版完整等价。
+- 当前结论：wrapper -> daemon -> scheduler -> worker 核心链路已实现。P0/P1/P2 主要特性均已移植，构建和全部单元测试通过。
 
 ## 阶段进度
 
@@ -43,12 +43,24 @@
 - **更新 `internal/client/client.go`**：接入 `compiler.IsDistributable()` 决策，可分发任务先预处理再提交 daemon，daemon 不可用或失败时自动回落本地编译。
 - **更新 `internal/daemon/server.go`**：统一实现 local daemon 和 servant 角色，提供 `/local/submit_task`，接入 L1/L2 缓存、Bloom Filter、taskgroup 去重、scheduler grant、远端 worker 提交、本地回落编译。
 - **实现 `internal/scheduler/server.go`**：worker 心跳注册、任务分配、释放、keep-alive、过期 worker 驱逐、基础 HTTP debug/metrics。
-- **实现 servant gRPC**：接收预处理源码，本地运行真实编译器，返回 `.o`，启动时向 scheduler 心跳注册。
+- **实现 servant gRPC**：接收预处理源码，本地运行真实编译器，收集输出目录下所有产物并逐个做路径 patch，启动时向 scheduler 心跳注册。
 - **更新 `cmd/yadcc-daemon/main.go`**：单进程同时承担 local daemon 和 servant 两个角色。
 - **补齐 `EnvironmentDesc` 接线**：scheduler 匹配和 cache key 已使用 compiler digest/kind/version、host OS/arch、target、object format、sysroot、stdlib、ABI、cache format version。
 - **补齐 compiler registry digest 到 path 映射**：远端 worker 按请求的 compiler digest 选择真实编译器，不再依赖重新扫描 PATH。
 - **增强 C/C++ 参数解析**：支持常见 joined 参数（如 `-Ifoo`、`-DDEBUG=1`、`-ofoo.o`、`-std=c++17`、`--sysroot=...`），预处理阶段保留 `-MD/-MMD/-MF/-MT/-MQ` 以生成本地依赖文件。
 - **保守处理多产物/非 object 场景**：`--coverage`、`-fprofile-arcs`、`-ftest-coverage`、`-E`、`-S`、`-fsyntax-only`、`-pipe` 等场景默认回退本地编译。
+- **增强 scheduler grant 行为**：`prefetch_requests` 参与 grant 数量计算，过期 grant 会同步释放 worker load。
+- **P0-1 路径规范化** (`internal/compiler/pathrewrite.go`)：`NormalizePreprocessed()` 在预处理输出中将主机绝对路径（srcDir、sysroot、系统 include）替换为规范占位符，使缓存 key 与构建机无关。
+- **P0-2 Token 认证** (`internal/auth/token.go`)：`Verifier` user/servant token 白名单，空 = 开放模式；daemon gRPC/HTTP、scheduler Heartbeat/WaitForStartingTask 均已接入；cmd 新增 `--user_tokens`/`--servant_tokens`。
+- **P0-3 Servant 异步写缓存** (`daemon/server.go`)：编译成功后异步（5 s 超时）写 L2 cache。
+- **P1-1 DiskStore LRU 驱逐**：`NewDiskStoreWithLimit`，内存 LRU atime 排序驱逐，`--disk-max-gb` 标志。
+- **P1-2 GetConfig RPC + config_keeper**：proto 新增 `GetConfig`；scheduler handler；daemon `configKeeperLoop` 每 60 s 拉取并动态更新 token + `servantSem`。
+- **P1-3 cgroup v1/v2 感知内存** (`internal/sysinfo/sysinfo_linux.go`)：容器内存限制覆盖 `/proc/meminfo`。
+- **P1-4 远程任务失败重试**：`tryRemote` 最多 3 次（`maxRemoteRetries=2`）。
+- **P2-1 file_digest_cache** (`internal/compiler/digest_cache.go`)：`(path, mtime, size) → sha256` LRU，`buildCacheKey` 使用 `DigestCached()`。
+- **P2-2 consistent hash 环** (`internal/consistent/hash.go`)：150 虚节点，SHA-256，线程安全，含单元测试。
+- **P2-4 task quota** (`internal/quota/quota.go`)：wrapper 侧并发信号量，默认 8×NumCPU（上限 256）。
+- **P2-5 /dev/shm 临时文件优先** (`internal/daemon/tempdir_linux.go`)：Linux 优先 `/dev/shm`，非 Linux 用 `os.TempDir()`。
 
 ## 当前实现范围
 
@@ -63,7 +75,7 @@ wrapper (cmd/yadcc)
         -> L1 cache 查询 (internal/cache.MemoryStore)
         -> 向 scheduler 申请 worker grant (gRPC WaitForStartingTask)
         -> gRPC QueueCxxCompilationTask 到 servant
-           -> servant (internal/daemon): 写临时文件，运行真实编译器，返回 .o
+           -> servant (internal/daemon): 写临时文件，运行真实编译器，返回输出文件列表
         -> L1/L2 cache 写入
         -> 本地回落（semaphore 限速）
   -> wrapper 收到 .o，写入输出路径
@@ -73,17 +85,16 @@ wrapper (cmd/yadcc)
 ### scheduler
 - worker 通过 heartbeat 注册和更新状态，过期驱逐（30s 超时）。
 - dedicated 优先、空闲 slot 优先、自回避、低内存过滤。
-- grant 分配、释放、keep-alive、运行中任务查询。
+- grant 分配、prefetch、释放、keep-alive、运行中任务查询。
 - `/scheduler/state` 返回真实 workers/running_tasks 统计。
 
 ### servant
 - 接收预处理源码，生成临时 .i/.ii 文件。
-- 按 compiler digest 选择本机真实编译器，生成临时 .o，读回并返回。
+- 按 compiler digest 选择本机真实编译器，生成临时输出目录，读回所有输出文件并返回。
 - 启动后通过 heartbeat 注册 scheduler，后台 10s 心跳。
 
 ## 待完成
 
-- C/C++ 参数解析仍需迁移更多原版 `compiler_args` 用例，覆盖更多 clang/gcc/macOS SDK 参数和危险参数本地回退场景。
 - `EnvironmentDesc` 已接线，但 sysroot/stdlib digest 仍是轻量启发式，需要更严格的 toolchain/SDK 指纹。
 - 将当前标准库 `sha256` cache key hash 升级为 BLAKE3。
 - COS cache engine 未移植。

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "yadcc-go/api/gen/yadcc/v1"
+	"yadcc-go/internal/auth"
 	"yadcc-go/internal/buildinfo"
 	"yadcc-go/internal/metrics"
 
@@ -52,6 +53,18 @@ type Server struct {
 	// HTTPAddr is the optional debug/healthz HTTP address (e.g. "0.0.0.0:8337").
 	// Leave empty to disable.
 	HTTPAddr string
+	// UserTokens is the whitelist of accepted user tokens.
+	// Empty means accept all.
+	UserTokens []string
+	// ServantTokens is the whitelist of accepted servant (worker) tokens.
+	// Empty means accept all.
+	ServantTokens []string
+	// MaxLocalParallelTasks is the cluster-wide override for daemon local concurrency.
+	// 0 = each daemon uses its own default.
+	MaxLocalParallelTasks uint32
+	// MaxServantTasks is the cluster-wide override for servant capacity.
+	// 0 = each daemon uses its own default.
+	MaxServantTasks uint32
 
 	initOnce sync.Once
 	mu       sync.Mutex
@@ -59,6 +72,7 @@ type Server struct {
 	workers  map[string]*workerEntry
 	grants   map[uint64]*taskGrant
 	nextID   atomic.Uint64
+	verifier auth.Verifier
 }
 
 // ensureInit initialises the maps and cond exactly once.  It is safe to call
@@ -68,6 +82,8 @@ func (s *Server) ensureInit() {
 		s.cond = sync.NewCond(&s.mu)
 		s.workers = make(map[string]*workerEntry)
 		s.grants = make(map[uint64]*taskGrant)
+		s.verifier.SetUserTokens(s.UserTokens)
+		s.verifier.SetServantTokens(s.ServantTokens)
 	})
 }
 
@@ -97,6 +113,9 @@ func (s *Server) ListenAndServe() error {
 // Heartbeat is called by remote workers to register themselves and report load.
 func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	s.ensureInit()
+	if !s.verifier.VerifyServant(req.Token) {
+		return nil, status.Error(codes.Unauthenticated, "invalid servant token")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -122,9 +141,13 @@ func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 	for gid, g := range s.grants {
 		if g.workerID == req.Token && time.Since(g.keepAlive) > 2*time.Minute {
 			expired = append(expired, gid)
+			if w, ok := s.workers[g.workerID]; ok && w.currentLoad > 0 {
+				w.currentLoad--
+			}
 			delete(s.grants, gid)
 		}
 	}
+	metrics.SchedulerGrantsActive.Set(float64(len(s.grants)))
 
 	// Wake any WaitForStartingTask callers that may now be satisfiable.
 	s.cond.Broadcast()
@@ -141,7 +164,13 @@ func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 // then returns ResourceExhausted if still none available.
 func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartingTaskRequest) (*pb.WaitForStartingTaskResponse, error) {
 	s.ensureInit()
+	if !s.verifier.VerifyUser(req.Token) {
+		return nil, status.Error(codes.Unauthenticated, "invalid user token")
+	}
 	want := int(req.ImmediateRequests)
+	if req.PrefetchRequests > 0 {
+		want += int(req.PrefetchRequests)
+	}
 	if want <= 0 {
 		want = 1
 	}
@@ -450,4 +479,20 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// GetConfig returns the current cluster-wide daemon configuration.
+// Daemons call this periodically (config_keeper) to pick up operator changes
+// such as token updates or concurrency overrides.
+func (s *Server) GetConfig(_ context.Context, req *pb.GetConfigRequest) (*pb.GetConfigResponse, error) {
+	s.ensureInit()
+	if !s.verifier.VerifyAny(req.Token) {
+		return nil, status.Error(codes.Unauthenticated, "invalid token")
+	}
+	return &pb.GetConfigResponse{
+		MaxLocalParallelTasks:   s.MaxLocalParallelTasks,
+		MaxServantTasks:         s.MaxServantTasks,
+		AcceptableUserTokens:    s.verifier.UserTokenSnapshot(),
+		AcceptableServantTokens: s.verifier.ServantTokenSnapshot(),
+	}, nil
 }

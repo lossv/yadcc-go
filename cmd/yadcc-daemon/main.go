@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"strings"
 
 	"yadcc-go/internal/daemon"
 )
@@ -18,7 +19,11 @@ func main() {
 	cacheAddr := flag.String("cache_addr", "",
 		"yadcc-cache gRPC address (empty = in-process L1 memory cache only)")
 	token := flag.String("token", "yadcc",
-		"authentication token for scheduler and cache")
+		"authentication token sent to scheduler and cache")
+	userTokens := flag.String("user_tokens", "",
+		"comma-separated accepted user tokens from wrappers (empty = accept all)")
+	servantTokens := flag.String("servant_tokens", "",
+		"comma-separated accepted servant tokens (empty = accept all)")
 	servantPriority := flag.String("servant_priority", "user",
 		"CPU allocation for remote tasks: user (~40% CPUs) or dedicated (~95% CPUs)")
 	workerID := flag.String("worker_id", "",
@@ -40,6 +45,8 @@ func main() {
 		SchedulerAddr:   *schedulerURI,
 		CacheAddr:       *cacheAddr,
 		Token:           *token,
+		UserTokens:      splitTokens(*userTokens),
+		ServantTokens:   splitTokens(*servantTokens),
 		ServantPriority: prio,
 		WorkerID:        *workerID,
 	}
@@ -55,4 +62,18 @@ func main() {
 		slog.Error("daemon stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func splitTokens(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

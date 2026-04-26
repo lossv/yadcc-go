@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -161,6 +163,41 @@ func TestBuildCompileArgs_joinedOutputReplacedOnce(t *testing.T) {
 	if outputs != 1 {
 		t.Fatalf("output flag count = %d, want 1 in %v", outputs, args)
 	}
+}
+
+func TestCollectOutputs_patchesEveryOutput(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "output.o"), []byte("abc /tmp/remote/source.i xyz"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "output.d"), []byte("/tmp/remote/source.i: header.h"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outputs, err := collectOutputs(dir, "/tmp/remote/source.i", "/src/local/source.c")
+	if err != nil {
+		t.Fatalf("collectOutputs: %v", err)
+	}
+	if len(outputs) != 2 {
+		t.Fatalf("output count = %d, want 2", len(outputs))
+	}
+	for _, out := range outputs {
+		if string(out.Data) == "" || containsBytes(out.Data, []byte("/tmp/remote/source.i")) {
+			t.Fatalf("output %s was not patched: %q", out.Name, out.Data)
+		}
+	}
+	if primaryObject(outputs) == nil {
+		t.Fatal("primaryObject returned nil")
+	}
+}
+
+func containsBytes(haystack, needle []byte) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if string(haystack[i:i+len(needle)]) == string(needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- preprocessedLangFlag ----------

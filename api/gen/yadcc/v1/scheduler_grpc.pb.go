@@ -24,6 +24,7 @@ const (
 	SchedulerService_KeepTaskAlive_FullMethodName       = "/yadcc.v1.SchedulerService/KeepTaskAlive"
 	SchedulerService_FreeTask_FullMethodName            = "/yadcc.v1.SchedulerService/FreeTask"
 	SchedulerService_GetRunningTasks_FullMethodName     = "/yadcc.v1.SchedulerService/GetRunningTasks"
+	SchedulerService_GetConfig_FullMethodName           = "/yadcc.v1.SchedulerService/GetConfig"
 )
 
 // SchedulerServiceClient is the client API for SchedulerService service.
@@ -35,6 +36,9 @@ type SchedulerServiceClient interface {
 	KeepTaskAlive(ctx context.Context, in *KeepTaskAliveRequest, opts ...grpc.CallOption) (*KeepTaskAliveResponse, error)
 	FreeTask(ctx context.Context, in *FreeTaskRequest, opts ...grpc.CallOption) (*FreeTaskResponse, error)
 	GetRunningTasks(ctx context.Context, in *GetRunningTasksRequest, opts ...grpc.CallOption) (*GetRunningTasksResponse, error)
+	// GetConfig allows daemons to pull dynamic cluster configuration (e.g.
+	// acceptable user tokens, servant capacity overrides).
+	GetConfig(ctx context.Context, in *GetConfigRequest, opts ...grpc.CallOption) (*GetConfigResponse, error)
 }
 
 type schedulerServiceClient struct {
@@ -95,6 +99,16 @@ func (c *schedulerServiceClient) GetRunningTasks(ctx context.Context, in *GetRun
 	return out, nil
 }
 
+func (c *schedulerServiceClient) GetConfig(ctx context.Context, in *GetConfigRequest, opts ...grpc.CallOption) (*GetConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetConfigResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_GetConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SchedulerServiceServer is the server API for SchedulerService service.
 // All implementations must embed UnimplementedSchedulerServiceServer
 // for forward compatibility.
@@ -104,6 +118,9 @@ type SchedulerServiceServer interface {
 	KeepTaskAlive(context.Context, *KeepTaskAliveRequest) (*KeepTaskAliveResponse, error)
 	FreeTask(context.Context, *FreeTaskRequest) (*FreeTaskResponse, error)
 	GetRunningTasks(context.Context, *GetRunningTasksRequest) (*GetRunningTasksResponse, error)
+	// GetConfig allows daemons to pull dynamic cluster configuration (e.g.
+	// acceptable user tokens, servant capacity overrides).
+	GetConfig(context.Context, *GetConfigRequest) (*GetConfigResponse, error)
 	mustEmbedUnimplementedSchedulerServiceServer()
 }
 
@@ -128,6 +145,9 @@ func (UnimplementedSchedulerServiceServer) FreeTask(context.Context, *FreeTaskRe
 }
 func (UnimplementedSchedulerServiceServer) GetRunningTasks(context.Context, *GetRunningTasksRequest) (*GetRunningTasksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRunningTasks not implemented")
+}
+func (UnimplementedSchedulerServiceServer) GetConfig(context.Context, *GetConfigRequest) (*GetConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConfig not implemented")
 }
 func (UnimplementedSchedulerServiceServer) mustEmbedUnimplementedSchedulerServiceServer() {}
 func (UnimplementedSchedulerServiceServer) testEmbeddedByValue()                          {}
@@ -240,6 +260,24 @@ func _SchedulerService_GetRunningTasks_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SchedulerService_GetConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).GetConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_GetConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).GetConfig(ctx, req.(*GetConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SchedulerService_ServiceDesc is the grpc.ServiceDesc for SchedulerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -266,6 +304,10 @@ var SchedulerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRunningTasks",
 			Handler:    _SchedulerService_GetRunningTasks_Handler,
+		},
+		{
+			MethodName: "GetConfig",
+			Handler:    _SchedulerService_GetConfig_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

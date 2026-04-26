@@ -132,6 +132,55 @@ func TestWaitForStartingTask_incrementsLoad(t *testing.T) {
 	}
 }
 
+func TestWaitForStartingTask_prefetchRequests(t *testing.T) {
+	s := newServer()
+	registerWorker(t, s, "w1", "host:1", 4, 0)
+
+	resp, err := s.WaitForStartingTask(context.Background(), &pb.WaitForStartingTaskRequest{
+		ImmediateRequests:  1,
+		PrefetchRequests:   2,
+		MillisecondsToWait: 0,
+	})
+	if err != nil {
+		t.Fatalf("WaitForStartingTask failed: %v", err)
+	}
+	if len(resp.Grants) != 3 {
+		t.Fatalf("grant count = %d, want 3", len(resp.Grants))
+	}
+}
+
+func TestHeartbeat_expiredGrantDecrementsLoad(t *testing.T) {
+	s := newServer()
+	registerWorker(t, s, "w1", "host:1", 4, 0)
+	resp, _ := s.WaitForStartingTask(context.Background(), &pb.WaitForStartingTaskRequest{
+		ImmediateRequests:  1,
+		MillisecondsToWait: 0,
+	})
+	grantID := resp.Grants[0].TaskGrantId
+
+	s.mu.Lock()
+	s.grants[grantID].keepAlive = time.Now().Add(-3 * time.Minute)
+	s.mu.Unlock()
+
+	hb, err := s.Heartbeat(context.Background(), &pb.HeartbeatRequest{
+		Token:       "w1",
+		Location:    "host:1",
+		Capacity:    4,
+		CurrentLoad: 1,
+	})
+	if err != nil {
+		t.Fatalf("Heartbeat failed: %v", err)
+	}
+	if len(hb.ExpiredTaskGrantIds) != 1 || hb.ExpiredTaskGrantIds[0] != grantID {
+		t.Fatalf("expired grants = %v, want [%d]", hb.ExpiredTaskGrantIds, grantID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.workers["w1"].currentLoad != 0 {
+		t.Fatalf("currentLoad = %d, want 0", s.workers["w1"].currentLoad)
+	}
+}
+
 // ---------- KeepTaskAlive ----------
 
 func TestKeepTaskAlive_refreshesGrant(t *testing.T) {

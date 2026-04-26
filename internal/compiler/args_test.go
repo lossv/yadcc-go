@@ -69,6 +69,8 @@ func TestParseRejectsCoverageAndPreprocessOnly(t *testing.T) {
 		{"-S", "hello.c"},
 		{"-fsyntax-only", "hello.c"},
 		{"-c", "-pipe", "hello.c"},
+		{"-c", "-Xclang", "-ast-dump", "hello.c"},
+		{"-c", "-ftime-trace", "hello.c"},
 	} {
 		if Parse(argv).IsDistributable() {
 			t.Fatalf("Parse(%v).IsDistributable() = true, want false", argv)
