@@ -73,7 +73,7 @@ func TestWaitForStartingTask_getsGrant(t *testing.T) {
 	registerWorker(t, s, "w1", "127.0.0.1:9001", 4, 0)
 
 	resp, err := s.WaitForStartingTask(context.Background(), &pb.WaitForStartingTaskRequest{
-		ImmediateRequests: 1,
+		ImmediateRequests:  1,
 		MillisecondsToWait: 0,
 	})
 	if err != nil {
@@ -94,7 +94,7 @@ func TestWaitForStartingTask_noWorkerReturnsError(t *testing.T) {
 	defer cancel()
 
 	_, err := s.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
-		ImmediateRequests: 1,
+		ImmediateRequests:  1,
 		MillisecondsToWait: 0,
 	})
 	if err == nil {
@@ -246,5 +246,17 @@ func TestWorkerSupportsEnv_archMismatch(t *testing.T) {
 	env := &pb.EnvironmentDesc{CompilerDigest: "abc123", HostArch: "amd64"}
 	if workerSupportsEnv(w, env) {
 		t.Error("worker with arm64 should NOT match amd64 request")
+	}
+}
+
+func TestWorkerSupportsEnv_digestAllowsCompilerAlias(t *testing.T) {
+	w := &workerEntry{
+		environments: []*pb.EnvironmentDesc{
+			{CompilerDigest: "abc123", CompilerKind: "clang", CompilerVersion: "clang 17"},
+		},
+	}
+	env := &pb.EnvironmentDesc{CompilerDigest: "abc123", CompilerKind: "cc", CompilerVersion: "Apple clang 17"}
+	if !workerSupportsEnv(w, env) {
+		t.Error("matching digest should allow compiler name/version aliases")
 	}
 }

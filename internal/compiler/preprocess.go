@@ -52,27 +52,17 @@ func Preprocess(compilerPath string, a Args) (PreprocessResult, error) {
 }
 
 // buildPreprocessArgs returns the argument list for a -E invocation based on
-// the original compile args.  It strips compilation-only flags (-c, -o, -MF,
-// -MT, -MQ, -MD, -MMD, -MP) and adds -E -x <lang> -o -.
+// the original compile args. It strips compilation-only flags (-c, -o) and
+// keeps -MD/-MMD/-MF/-MT/-MQ so build systems still receive dependency files
+// from the local preprocessing step.
 func buildPreprocessArgs(a Args, lang string, inputFile string) []string {
 	skipKeys := map[string]bool{
-		"-c": true, "-o": true, "-MF": true, "-MT": true, "-MQ": true,
+		"-c": true, "-o": true,
 	}
-	skipPrefixes := []string{"-MD", "-MMD", "-MP", "-MG"}
 
 	var args []string
 	for _, opt := range a.options {
 		if skipKeys[opt.Key] {
-			continue
-		}
-		skip := false
-		for _, p := range skipPrefixes {
-			if opt.Key == p {
-				skip = true
-				break
-			}
-		}
-		if skip {
 			continue
 		}
 		args = append(args, opt.Key)

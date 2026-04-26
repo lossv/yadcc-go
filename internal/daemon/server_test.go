@@ -63,11 +63,11 @@ func TestIsCacheable_partialOverride(t *testing.T) {
 // ---------- normalizeArgs ----------
 
 func TestNormalizeArgs_stripsOutputAndDeps(t *testing.T) {
-	args := []string{"-O2", "-o", "foo.o", "-MF", "foo.d", "-MD", "-c"}
+	args := []string{"-O2", "-o", "foo.o", "-MF", "foo.d", "-MD", "-c", "src.c", "-ofoo2.o", "-MFfoo2.d"}
 	got := normalizeArgs(args)
 	for _, a := range got {
 		switch a {
-		case "-o", "foo.o", "-MF", "foo.d", "-MD":
+		case "-o", "foo.o", "-MF", "foo.d", "-MD", "src.c", "-ofoo2.o", "-MFfoo2.d":
 			t.Errorf("unexpected arg in normalized output: %q", a)
 		}
 	}
@@ -108,10 +108,20 @@ func TestBuildLocalArgs_cppLang(t *testing.T) {
 }
 
 func TestBuildLocalArgs_outputReplaced(t *testing.T) {
-	args := buildLocalArgs([]string{"-c", "-o", "wrong.o"}, "c", "/tmp/s.i", "/tmp/correct.o")
+	args := buildLocalArgs([]string{"-c", "-owrong.o"}, "c", "/tmp/s.i", "/tmp/correct.o")
 	for i, a := range args {
 		if a == "-o" && i+1 < len(args) && args[i+1] != "/tmp/correct.o" {
 			t.Errorf("output not replaced: got %q", args[i+1])
+		}
+	}
+}
+
+func TestBuildLocalArgs_stripsDependencyAndLanguageFlags(t *testing.T) {
+	args := buildLocalArgs([]string{"-xc++", "-MD", "-MFfoo.d", "-MT", "target", "-c", "-oout.o", "src.cc"}, "c++", "/tmp/s.ii", "/tmp/out.o")
+	for _, a := range args {
+		switch a {
+		case "-xc++", "-MD", "-MFfoo.d", "-MT", "target", "-oout.o", "src.cc":
+			t.Fatalf("unexpected arg survived: %q in %v", a, args)
 		}
 	}
 }
@@ -131,6 +141,25 @@ func TestBuildCompileArgs_stripsEFlag(t *testing.T) {
 		if a == "-E" {
 			t.Error("-E should be stripped by buildCompileArgs")
 		}
+	}
+}
+
+func TestBuildCompileArgs_joinedOutputReplacedOnce(t *testing.T) {
+	args := buildCompileArgs([]string{"-O2", "-c", "-ofoo.o", "-xc++", "src.cc"}, "/tmp/src.ii", "/tmp/out.o")
+	outputs := 0
+	for i, a := range args {
+		if a == "-o" {
+			outputs++
+			if i+1 >= len(args) || args[i+1] != "/tmp/out.o" {
+				t.Fatalf("bad output args: %v", args)
+			}
+		}
+		if a == "-ofoo.o" || a == "-xc++" || a == "src.cc" {
+			t.Fatalf("unexpected arg survived: %q in %v", a, args)
+		}
+	}
+	if outputs != 1 {
+		t.Fatalf("output flag count = %d, want 1 in %v", outputs, args)
 	}
 }
 

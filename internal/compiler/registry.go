@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ type Registry struct {
 
 	mu       sync.RWMutex
 	envDescs []*pb.EnvironmentDesc // protected by mu
+	paths    map[string]string     // compiler digest -> canonical path
 	done     chan struct{}
 }
 
@@ -55,8 +57,20 @@ func (r *Registry) Environments() []*pb.EnvironmentDesc {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]*pb.EnvironmentDesc, len(r.envDescs))
-	copy(out, r.envDescs)
+	for i, e := range r.envDescs {
+		cp := *e
+		out[i] = &cp
+	}
 	return out
+}
+
+// PathByDigest returns the canonical compiler path for a digest discovered by
+// the registry.
+func (r *Registry) PathByDigest(digest string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	path, ok := r.paths[digest]
+	return path, ok
 }
 
 func (r *Registry) loop() {
@@ -80,6 +94,7 @@ func (r *Registry) scan() {
 	dirs := r.searchDirs()
 	seen := make(map[string]bool) // canonical path → already added
 	var descs []*pb.EnvironmentDesc
+	paths := make(map[string]string)
 
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
@@ -116,9 +131,10 @@ func (r *Registry) scan() {
 				continue
 			}
 
-			descs = append(descs, &pb.EnvironmentDesc{
-				CompilerDigest: digest,
-			})
+			env := EnvironmentForCompiler(canonical, Args{})
+			env.CompilerDigest = digest
+			descs = append(descs, env)
+			paths[digest] = canonical
 			slog.Debug("compiler registry: discovered compiler",
 				"name", name, "path", canonical, "digest", digest[:8]+"…")
 		}
@@ -126,6 +142,7 @@ func (r *Registry) scan() {
 
 	r.mu.Lock()
 	r.envDescs = descs
+	r.paths = paths
 	r.mu.Unlock()
 	slog.Info("compiler registry: scan complete", "compilers", len(descs))
 }
@@ -245,4 +262,78 @@ func LookupCompilerOrFallback(name, selfPath string) (string, error) {
 		return p, nil
 	}
 	return exec.LookPath(name)
+}
+
+// EnvironmentForCompiler builds the environment descriptor used by scheduler
+// matching and cache-key isolation. Empty args are valid for registry
+// advertisements where per-task target/sysroot flags are not known.
+func EnvironmentForCompiler(path string, args Args) *pb.EnvironmentDesc {
+	if canonical, err := filepath.EvalSymlinks(path); err == nil {
+		path = canonical
+	}
+
+	abi := ""
+	if args.Has("-m32") {
+		abi = "ilp32"
+	} else if args.Has("-m64") {
+		abi = "lp64"
+	}
+
+	digest, _ := Digest(path)
+	return &pb.EnvironmentDesc{
+		CompilerDigest:     digest,
+		CompilerKind:       CompilerKind(path),
+		CompilerVersion:    CompilerVersion(path),
+		HostOs:             runtime.GOOS,
+		HostArch:           runtime.GOARCH,
+		TargetTriple:       args.TargetTriple(),
+		ObjectFormat:       objectFormat(runtime.GOOS),
+		SysrootDigest:      SysrootDigest(args.Sysroot()),
+		StdlibDigest:       StdlibDigest(path, args.Stdlib()),
+		Abi:                abi,
+		CacheFormatVersion: 1,
+	}
+}
+
+func CompilerKind(path string) string {
+	name := filepath.Base(path)
+	switch {
+	case strings.Contains(name, "clang++"):
+		return "clang++"
+	case strings.Contains(name, "clang"):
+		return "clang"
+	case strings.Contains(name, "g++"):
+		return "g++"
+	case strings.Contains(name, "gcc"):
+		return "gcc"
+	case name == "c++":
+		return "c++"
+	case name == "cc":
+		return "cc"
+	default:
+		return name
+	}
+}
+
+func CompilerVersion(path string) string {
+	out, err := exec.Command(path, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if len(line) > 200 {
+		line = line[:200]
+	}
+	return line
+}
+
+func objectFormat(goos string) string {
+	switch goos {
+	case "darwin":
+		return "macho"
+	case "windows":
+		return "coff"
+	default:
+		return "elf"
+	}
 }

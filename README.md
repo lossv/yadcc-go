@@ -2,7 +2,7 @@
 
 `yadcc-go` 是 [yadcc](https://github.com/Tencent/yadcc)（Yet Another Distributed C++ Compiler）的 Go 移植版本，实现了与原版相同的核心功能：将 C/C++ 编译任务分发到集群中的多台机器，同时在本地提供多级缓存，大幅缩短大型项目的构建时间。
 
-> **当前状态**：功能完整，可用于生产试验。与 C++ 原版使用不兼容的 wire protocol（使用 gRPC 而非 Flare RPC），缓存 key 采用 SHA-256（原版用 BLAKE3），两者**不共享缓存**。
+> **当前状态**：Linux 基础分布式编译闭环已打通，L1/L2 缓存、Bloom Filter、scheduler grant/keep-alive 和基础 metrics 已接入；仍不是 C++ 原版的完整等价移植。与 C++ 原版使用不兼容的 wire protocol（使用 gRPC/HTTP 而非 Flare RPC），缓存 key 采用 SHA-256（原版用 BLAKE3），两者**不共享缓存**。
 
 ---
 
@@ -197,7 +197,7 @@ yadcc-daemon [flags]
 | `--servant_addr` | `0.0.0.0:8335` | 接受远端编译任务的 gRPC 监听地址。需要在防火墙中对集群内部开放。 |
 | `--scheduler_uri` | `""`（空） | scheduler 的 gRPC 地址，格式 `host:port`，例如 `10.0.0.1:8336`。**留空则禁用分布式编译**，只走本地 + 缓存。 |
 | `--cache_addr` | `""`（空） | yadcc-cache 的 gRPC 地址，格式 `host:port`。留空则只使用进程内 L1 缓存。 |
-| `--token` | `yadcc` | 与 scheduler 和 cache 通信使用的认证 token。集群内所有组件必须使用**相同的 token**。 |
+| `--token` | `yadcc` | 预留的共享 token 字段，当前仅随部分 RPC 传递，尚未形成完整认证机制。 |
 | `--servant_priority` | `user` | 控制为远端任务分配多少 CPU。`user`（开发机）≈ 40% 逻辑 CPU；`dedicated`（构建场专用机）≈ 95% 逻辑 CPU。 |
 | `--worker_id` | `hostname:port` | 该节点在 scheduler 中的唯一标识。默认自动生成为 `主机名:servant端口`，通常无需修改。 |
 
@@ -207,7 +207,7 @@ yadcc-daemon [flags]
 - **L2 缓存**：连接到外部 `yadcc-cache`（若配置），命中直接返回不占用远端 CPU。
 - **Bloom filter 预检**：daemon 后台每 60 秒从 `yadcc-cache` 拉取布隆过滤器，L2 查询前先过滤，避免无效 RPC。
 - **Servant 并发限制**：servant 同时接受的远端任务数 = `capacity()`。`user` 模式下约为 CPU 数 × 0.40，`dedicated` 模式约为 CPU 数 × 0.95。超出容量时返回 `ResourceExhausted`，scheduler 会分配给其他节点。
-- **Grant 预取池**：daemon 后台预先向 scheduler 申请 grant 并缓存（最多 `min(4, CPU/2)` 个），收到 wrapper 请求时可立即开始分发，减少延迟。
+- **Grant 管理**：daemon 每次分布式任务按当前 `EnvironmentDesc` 向 scheduler 申请 grant，并在等待远端编译期间定期 keep-alive。
 - **自回退**：远端编译失败（网络错误、编译器版本不匹配等）时，自动在本机重新编译，**对 wrapper 透明**。
 - **路径修复**：servant 编译时使用临时文件，返回 object 前会将临时路径替换为原始源文件路径，保证 debug info 和 `__FILE__` 正确。
 - **内存上报**：heartbeat 中携带可用内存信息，scheduler 在机器可用内存低于 10 GiB 时不向其分配任务。
@@ -290,7 +290,7 @@ yadcc-cache [flags]
 | Flag | 默认值 | 说明 |
 |---|---|---|
 | `--grpc-addr` | `0.0.0.0:8338` | gRPC 监听地址，daemon 通过此地址读写缓存。 |
-| `--addr` | `0.0.0.0:8339` | HTTP 监听地址，提供 `/healthz`、`/cache/stats`、`/metrics`。 |
+| `--addr` | `0.0.0.0:8339` | HTTP 监听地址，提供 `/healthz`、`/cache/stats`、`/cache/entry`、`/cache/bloom`。 |
 | `--engine` | `memory` | 缓存后端：`memory`（进程内，重启丢失）或 `disk`（持久化）。 |
 | `--disk-dir` | `tmp/cache` | `--engine=disk` 时的缓存目录。建议使用绝对路径，并确保有足够空间。 |
 
@@ -340,7 +340,7 @@ yadcc-cache \
 
 - `:8334` 只需 loopback，**禁止对外暴露**
 - `:8335`、`:8336`、`:8338` 只对集群内部网段开放
-- `:8337`、`:8339` 可对运维网段开放（Prometheus 拉取 metrics）
+- `:8337` 可对运维网段开放（Prometheus 拉取 scheduler metrics）；`:8339` 是 cache HTTP debug/API 端口
 
 ---
 
@@ -511,7 +511,7 @@ curl http://cache-host:8339/cache/stats
 
 ### Prometheus 监控
 
-所有组件均在 `/metrics` 暴露 Prometheus metrics。
+daemon 和 scheduler 在 `/metrics` 暴露 Prometheus metrics。cache 目前维护内部指标并通过 daemon/scheduler 相关路径间接观测，HTTP cache 服务尚未暴露 `/metrics`。
 
 **Scrape 配置示例：**
 
@@ -640,7 +640,7 @@ tail -f /tmp/yadcc-logs/yadcc-daemon.log
 **部署建议：**
 
 1. **网络隔离**：将 `:8335`、`:8336`、`:8338` 端口限制在集群内网，不对公网暴露。
-2. **Token 认证**：`--token` 提供了基本的共享密钥认证，防止非授权节点加入。**生产环境请使用足够随机的 token（≥ 32 字节）**，而非默认的 `yadcc`。
+2. **认证边界**：当前 `--token` 还不是完整认证机制，不能阻止非授权节点加入。生产部署必须依赖内网隔离、防火墙或外层 mTLS/代理控制访问。
 3. **本地端口**：`:8334` 仅监听 loopback，无需额外保护，但 `--local_addr` **不要改为** `0.0.0.0`。
 4. **磁盘缓存权限**：`--disk-dir` 目录应限制为 yadcc-cache 进程的运行用户可读写，避免其他用户篡改缓存。
 
@@ -664,9 +664,9 @@ dedicated 模式的容量 = `floor(CPU数 × 0.95)`，但如果机器上除 yadc
 
 daemon 的 `ppSem` 大小 = `NumCPU`。如果机器同时运行大量构建进程导致 daemon 过载，它会优先让任务本地执行，而不是排队等待，保证不阻塞构建。
 
-**Grant 预取：**
+**Grant 申请：**
 
-daemon 后台预取 grant（默认池大小 `min(4, CPU/2)`）。如果调度延迟仍然明显，可以在源码中增大 `poolSize` 上限。
+daemon 当前按任务实时申请 grant，确保 scheduler 使用本次任务的 `EnvironmentDesc` 做匹配。后续如重新引入 grant 预取，需要按环境维度分池，避免拿到不兼容 worker。
 
 ---
 
@@ -676,10 +676,11 @@ daemon 后台预取 grant（默认池大小 `min(4, CPU/2)`）。如果调度延
 |---|---|
 | 与 C++ 原版缓存不兼容 | Go 版使用 SHA-256，C++ 版使用 BLAKE3，缓存 key 格式不同，无法共享 |
 | gRPC 明文传输 | 暂不支持 TLS，需依赖网络层隔离 |
-| Token 不支持轮转 | 认证 token 写死，变更需重启所有组件 |
+| 认证未完成 | `--token` 目前不是完整鉴权实现，需依赖网络层隔离 |
 | Scheduler 无高可用 | 单点，scheduler 宕机时所有分布式编译失败（自动回退本地） |
 | 仅支持 C/C++ | 不支持 Rust、Go、Fortran 等其他语言 |
 | 不支持 `-pipe` / stdin 编译 | 有 `-`（stdin）参数时自动回退本地 |
+| coverage/profile 多产物场景本地回退 | `--coverage`、`-fprofile-arcs`、`-ftest-coverage` 等需要额外产物，当前不分发 |
 | macOS 可用内存读取精度低 | macOS 下 `AvailableMemoryBytes` 仅能读取 free pages，不含可回收缓存 |
 
 ---

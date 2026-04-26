@@ -16,24 +16,67 @@ type Option struct {
 }
 
 var oneValueOptions = map[string]struct{}{
-	"-o":         {},
-	"-x":         {},
-	"-D":         {},
-	"-U":         {},
-	"-I":         {},
-	"-L":         {},
-	"-l":         {},
-	"-MF":        {},
-	"-MT":        {},
-	"-MQ":        {},
-	"-include":   {},
-	"-isystem":   {},
-	"-iquote":    {},
-	"-idirafter": {},
-	"-isysroot":  {},
-	"--sysroot":  {},
-	"-target":    {},
-	"-std":       {},
+	"-B":                          {},
+	"-D":                          {},
+	"-I":                          {},
+	"-L":                          {},
+	"-MF":                         {},
+	"-MQ":                         {},
+	"-MT":                         {},
+	"-U":                          {},
+	"-arch":                       {},
+	"-c-isystem":                  {},
+	"-cxx-isystem":                {},
+	"-gcc-toolchain":              {},
+	"-idirafter":                  {},
+	"-iframework":                 {},
+	"-imacros":                    {},
+	"-include":                    {},
+	"-include-pch":                {},
+	"-iquote":                     {},
+	"-isystem":                    {},
+	"-isystem-after":              {},
+	"-isysroot":                   {},
+	"-ivfsoverlay":                {},
+	"-iwithsysroot":               {},
+	"-l":                          {},
+	"-mllvm":                      {},
+	"-o":                          {},
+	"-resource-dir":               {},
+	"-std":                        {},
+	"-stdlib":                     {},
+	"-target":                     {},
+	"-x":                          {},
+	"--include-directory":         {},
+	"--include-directory-after":   {},
+	"--include-prefix":            {},
+	"--include-with-prefix":       {},
+	"--include-with-prefix-after": {},
+	"--library-directory":         {},
+	"--param":                     {},
+	"--resource":                  {},
+	"--rtlib":                     {},
+	"--stdlib":                    {},
+	"--sysroot":                   {},
+}
+
+var joinedValuePrefixes = []string{
+	"-D",
+	"-I",
+	"-L",
+	"-MF",
+	"-MQ",
+	"-MT",
+	"-U",
+	"-B",
+	"-l",
+	"-o",
+	"-std=",
+	"-stdlib=",
+	"--sysroot=",
+	"-isysroot=",
+	"-target=",
+	"-x",
 }
 
 func Parse(argv []string) Args {
@@ -49,6 +92,10 @@ func Parse(argv []string) Args {
 			out.options = append(out.options, opt)
 			continue
 		}
+		if opt, ok := splitJoinedOption(arg); ok {
+			out.options = append(out.options, opt)
+			continue
+		}
 		if strings.HasPrefix(arg, "-") {
 			out.options = append(out.options, Option{Key: arg})
 			continue
@@ -56,6 +103,27 @@ func Parse(argv []string) Args {
 		out.files = append(out.files, arg)
 	}
 	return out
+}
+
+func splitJoinedOption(arg string) (Option, bool) {
+	for _, prefix := range joinedValuePrefixes {
+		if !strings.HasPrefix(arg, prefix) || len(arg) == len(prefix) {
+			continue
+		}
+		switch prefix {
+		case "-std=", "-stdlib=", "--sysroot=", "-isysroot=", "-target=":
+			return Option{Key: strings.TrimSuffix(prefix, "="), Values: []string{strings.TrimPrefix(arg, prefix)}}, true
+		case "-x":
+			value := strings.TrimPrefix(arg, prefix)
+			if strings.HasPrefix(value, "=") {
+				return Option{}, false
+			}
+			return Option{Key: prefix, Values: []string{value}}, true
+		default:
+			return Option{Key: prefix, Values: []string{strings.TrimPrefix(arg, prefix)}}, true
+		}
+	}
+	return Option{}, false
 }
 
 func (a Args) Files() []string {
@@ -160,6 +228,18 @@ func (a Args) Stdlib() string {
 
 func (a Args) IsDistributable() bool {
 	if !a.Has("-c") {
+		return false
+	}
+	if a.Has("-E") || a.Has("-S") || a.Has("-fsyntax-only") || a.Has("-M") || a.Has("-MM") {
+		return false
+	}
+	if a.Has("-save-temps") || a.HasPrefix("-save-temps=") || a.Has("-pipe") {
+		return false
+	}
+	if a.Has("--coverage") || a.Has("-coverage") ||
+		a.Has("-fprofile-arcs") || a.Has("-ftest-coverage") ||
+		a.HasPrefix("-fprofile-generate") || a.HasPrefix("-fprofile-use") ||
+		a.HasPrefix("-fprofile-instr-generate") || a.HasPrefix("-fcoverage-") {
 		return false
 	}
 	if values, ok := a.Get("-x"); ok {

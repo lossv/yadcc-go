@@ -305,17 +305,50 @@ func (s *Server) pickWorker(env *pb.EnvironmentDesc, requesterLocation string) *
 // workerSupportsEnv checks whether the worker advertises the requested env.
 // When env is empty (zero-value), any worker is accepted.
 func workerSupportsEnv(w *workerEntry, env *pb.EnvironmentDesc) bool {
-	if env.CompilerDigest == "" {
+	if env == nil || (env.CompilerDigest == "" &&
+		env.CompilerKind == "" &&
+		env.CompilerVersion == "" &&
+		env.HostOs == "" &&
+		env.HostArch == "" &&
+		env.TargetTriple == "" &&
+		env.ObjectFormat == "" &&
+		env.SysrootDigest == "" &&
+		env.StdlibDigest == "" &&
+		env.Abi == "" &&
+		env.CacheFormatVersion == 0) {
 		return true
 	}
 	for _, e := range w.environments {
-		if e.CompilerDigest == env.CompilerDigest &&
-			(env.HostOs == "" || e.HostOs == env.HostOs) &&
-			(env.HostArch == "" || e.HostArch == env.HostArch) {
+		if !fieldMatches(env.CompilerDigest, e.CompilerDigest) {
+			continue
+		}
+		// The binary digest is the strongest compiler identity. When it is
+		// present, compiler kind/version may differ only because the same
+		// binary was reached through an alias such as cc -> clang.
+		compilerIdentityMatches := env.CompilerDigest != "" ||
+			(fieldMatches(env.CompilerKind, e.CompilerKind) &&
+				fieldMatches(env.CompilerVersion, e.CompilerVersion))
+		if compilerIdentityMatches &&
+			fieldMatches(env.HostOs, e.HostOs) &&
+			fieldMatches(env.HostArch, e.HostArch) &&
+			fieldMatches(env.TargetTriple, e.TargetTriple) &&
+			fieldMatches(env.ObjectFormat, e.ObjectFormat) &&
+			fieldMatches(env.SysrootDigest, e.SysrootDigest) &&
+			fieldMatches(env.StdlibDigest, e.StdlibDigest) &&
+			fieldMatches(env.Abi, e.Abi) &&
+			versionMatches(env.CacheFormatVersion, e.CacheFormatVersion) {
 			return true
 		}
 	}
 	return false
+}
+
+func fieldMatches(want, got string) bool {
+	return want == "" || want == got
+}
+
+func versionMatches(want, got uint32) bool {
+	return want == 0 || want == got
 }
 
 // evictLoop removes workers whose heartbeat has timed out and cleans up their

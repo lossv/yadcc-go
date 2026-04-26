@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,10 +104,6 @@ type Server struct {
 	bloomFilter    *cache.BloomFilter // may be nil if no external cache
 	bloomLastFetch time.Time
 
-	// grantPool is a small pre-fetched pool of task grants from the scheduler.
-	// When tryRemote needs a grant, it first checks this pool to reduce latency.
-	grantPool chan *pb.StartingTaskGrant
-
 	// --- servant (gRPC) side ---
 	pb.UnimplementedRemoteDaemonServiceServer
 	nextTaskID atomic.Uint64
@@ -176,13 +173,6 @@ func (s *Server) init() {
 		// In-process L1 cache.
 		s.store = cache.NewMemoryStore()
 
-		// Grant prefetch pool: capacity = min(4, maxLocalParallel).
-		poolSize := s.maxLocalParallel()
-		if poolSize > 4 {
-			poolSize = 4
-		}
-		s.grantPool = make(chan *pb.StartingTaskGrant, poolSize)
-
 		// Task map for servant side.
 		s.tasks = make(map[uint64]*taskRecord) // Servant semaphore: limits concurrent remote compile tasks.
 		cap := s.capacity()
@@ -242,7 +232,6 @@ func (s *Server) ListenAndServe() error {
 			slog.Warn("daemon: initial heartbeat failed", "error", err)
 		}
 		go s.heartbeatLoop()
-		go s.grantPrefetchLoop()
 	}
 
 	// Serve the local HTTP API (wrapper-facing).
@@ -440,33 +429,23 @@ func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	compilerDigest, _ := compiler.Digest(req.CompilerPath)
+	env := compiler.EnvironmentForCompiler(req.CompilerPath, compiler.Parse(req.Args))
 
-	// P1-8: try a pre-fetched grant from the pool first.
 	var grant *pb.StartingTaskGrant
-	select {
-	case grant = <-s.grantPool:
-		// Got a pooled grant — validate it's still for a live environment.
-		// (We can't check environment match here, so just use it optimistically.)
-	default:
-		// No pre-fetched grant; request one from the scheduler.
-		grantResp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
-			Token:              s.token(),
-			ImmediateRequests:  1,
-			MillisecondsToWait: waitForWorkerMs,
-			RequesterLocation:  s.servantAddr(),
-			Environment: &pb.EnvironmentDesc{
-				CompilerDigest: compilerDigest,
-			},
-		})
-		if err != nil {
-			return compileResult{}, fmt.Errorf("acquire worker: %w", err)
-		}
-		if len(grantResp.Grants) == 0 {
-			return compileResult{}, fmt.Errorf("no worker grants returned")
-		}
-		grant = grantResp.Grants[0]
+	grantResp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
+		Token:              s.token(),
+		ImmediateRequests:  1,
+		MillisecondsToWait: waitForWorkerMs,
+		RequesterLocation:  s.servantAddr(),
+		Environment:        env,
+	})
+	if err != nil {
+		return compileResult{}, fmt.Errorf("acquire worker: %w", err)
 	}
+	if len(grantResp.Grants) == 0 {
+		return compileResult{}, fmt.Errorf("no worker grants returned")
+	}
+	grant = grantResp.Grants[0]
 
 	workerConn, err := grpc.NewClient(grant.ServantLocation,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -486,11 +465,9 @@ func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
 	defer queueCancel()
 
 	queueResp, err := wc.QueueCxxCompilationTask(queueCtx, &pb.QueueCxxCompilationTaskRequest{
-		Token:       s.token(),
-		TaskGrantId: grant.TaskGrantId,
-		Environment: &pb.EnvironmentDesc{
-			CompilerDigest: compilerDigest,
-		},
+		Token:                  s.token(),
+		TaskGrantId:            grant.TaskGrantId,
+		Environment:            env,
 		SourcePath:             req.SourcePath,
 		CompilerArguments:      req.Args,
 		ZstdPreprocessedSource: compress.Compress(req.PreprocessedSource),
@@ -787,15 +764,8 @@ func (s *Server) resolveCompilerForRequest(req *pb.QueueCxxCompilationTaskReques
 	}
 
 	if wantDigest != "" && s.Registry != nil {
-		for _, env := range s.Registry.Environments() {
-			if env.CompilerDigest == wantDigest {
-				// The registry stores digests but not paths directly — look it
-				// up by re-scanning registered paths.  For now return the
-				// first match from PATH that hashes to the same digest.
-				if path := s.findCompilerByDigest(wantDigest); path != "" {
-					return path
-				}
-			}
+		if path, ok := s.Registry.PathByDigest(wantDigest); ok {
+			return path
 		}
 		slog.Warn("daemon: no local compiler matches requested digest",
 			"digest", wantDigest[:min(8, len(wantDigest))], "using", "cc")
@@ -898,40 +868,6 @@ func (s *Server) bloomMayContain(key string) bool {
 	return s.bloomFilter.MayContain(key)
 }
 
-// grantPrefetchLoop keeps the grantPool topped up by requesting additional
-// grants from the scheduler whenever the pool has free slots.
-func (s *Server) grantPrefetchLoop() {
-	for {
-		// Block until the pool has space.
-		slack := cap(s.grantPool) - len(s.grantPool)
-		if slack <= 0 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		// Request up to slack prefetch grants (non-blocking on the scheduler).
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		resp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
-			Token:              s.token(),
-			ImmediateRequests:  0,
-			PrefetchRequests:   uint32(slack),
-			MillisecondsToWait: 0,
-			RequesterLocation:  s.servantAddr(),
-		})
-		cancel()
-		if err == nil {
-			for _, g := range resp.Grants {
-				select {
-				case s.grantPool <- g:
-				default:
-					// Pool full — free the extra grant.
-					s.freeGrant(g.TaskGrantId)
-				}
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
 // ---------- scheduler heartbeat ----------
 
 func (s *Server) heartbeatLoop() {
@@ -956,7 +892,7 @@ func (s *Server) sendHeartbeat() error {
 	si := sysinfo.Get()
 
 	_, err := s.schedulerClient.Heartbeat(ctx, &pb.HeartbeatRequest{
-		Token:                s.token(),
+		Token:                s.WorkerID,
 		Location:             s.servantAddr(),
 		Capacity:             s.capacity(),
 		CurrentLoad:          load,
@@ -1094,45 +1030,45 @@ func buildCacheKey(req SubmitRequest) string {
 
 	parsed := compiler.Parse(req.Args)
 
-	// Determine ABI suffix from -m32 / -m64.
-	abi := ""
-	if parsed.Has("-m32") {
-		abi = "ilp32"
-	} else if parsed.Has("-m64") {
-		abi = "lp64"
-	}
-
-	sysrootDigest := compiler.SysrootDigest(parsed.Sysroot())
-	stdlibDigest := compiler.StdlibDigest(req.CompilerPath, parsed.Stdlib())
-
 	sourceDigest := sha256.Sum256(req.PreprocessedSource)
+	env := compiler.EnvironmentForCompiler(req.CompilerPath, parsed)
 
 	input := cache.KeyInput{
 		CompilerDigest:           compilerDigest,
-		CompilerKind:             req.Language,
-		TargetTriple:             parsed.TargetTriple(),
-		ABI:                      abi,
-		SysrootDigest:            sysrootDigest,
-		StdlibDigest:             stdlibDigest,
+		CompilerKind:             env.CompilerKind,
+		CompilerVersion:          env.CompilerVersion,
+		HostOS:                   env.HostOs,
+		HostArch:                 env.HostArch,
+		TargetTriple:             env.TargetTriple,
+		ObjectFormat:             env.ObjectFormat,
+		ABI:                      env.Abi,
+		SysrootDigest:            env.SysrootDigest,
+		StdlibDigest:             env.StdlibDigest,
 		NormalizedArguments:      normalizeArgs(req.Args),
 		PreprocessedSourceDigest: hex.EncodeToString(sourceDigest[:]),
+		OutputKind:               "object",
 	}
 	return cache.BuildKey(input)
 }
 
 func normalizeArgs(args []string) []string {
-	skip := false
 	var out []string
-	for _, a := range args {
-		if skip {
-			skip = false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "" {
 			continue
 		}
 		switch a {
 		case "-o", "-MF", "-MT", "-MQ":
-			skip = true
+			i++
 		case "-MD", "-MMD", "-MP", "-MG":
 		default:
+			if isJoinedOutputArg(a) || isJoinedDependencyArg(a) {
+				continue
+			}
+			if a[0] != '-' {
+				continue
+			}
 			out = append(out, a)
 		}
 	}
@@ -1149,23 +1085,28 @@ func buildLocalArgs(originalArgs []string, lang, tmpFile, outputFile string) []s
 			skip = false
 			continue
 		}
-		if a[0] != '-' {
+		if len(a) == 0 || a[0] != '-' {
 			continue
 		}
-		switch a {
-		case "-o":
+		switch {
+		case a == "-o":
 			if i+1 < len(originalArgs) {
 				skip = true
 			}
 			args = append(args, "-o", outputFile)
 			hasOutput = true
-		case "-x":
+		case joinedOutputArg(a):
+			args = append(args, "-o", outputFile)
+			hasOutput = true
+		case a == "-x":
 			if i+1 < len(originalArgs) {
 				skip = true
 			}
-		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
-		case "-MF", "-MT", "-MQ":
+		case joinedLangArg(a):
+		case a == "-E" || a == "-fdirectives-only" || a == "-MD" || a == "-MMD" || a == "-MP" || a == "-MG":
+		case a == "-MF" || a == "-MT" || a == "-MQ":
 			skip = true
+		case joinedDependencyArg(a):
 		default:
 			args = append(args, a)
 		}
@@ -1194,20 +1135,25 @@ func buildCompileArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 		if len(a) == 0 || a[0] != '-' {
 			continue
 		}
-		switch a {
-		case "-o":
+		switch {
+		case a == "-o":
 			if i+1 < len(originalArgs) {
 				skip = true
 			}
 			args = append(args, "-o", tmpOut)
 			hasOutput = true
-		case "-x":
+		case joinedOutputArg(a):
+			args = append(args, "-o", tmpOut)
+			hasOutput = true
+		case a == "-x":
 			if i+1 < len(originalArgs) {
 				skip = true
 			}
-		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
-		case "-MF", "-MT", "-MQ":
+		case joinedLangArg(a):
+		case a == "-E" || a == "-fdirectives-only" || a == "-MD" || a == "-MMD" || a == "-MP" || a == "-MG":
+		case a == "-MF" || a == "-MT" || a == "-MQ":
 			skip = true
+		case joinedDependencyArg(a):
 		default:
 			args = append(args, a)
 		}
@@ -1227,6 +1173,9 @@ func inferLang(args []string) string {
 		if a == "-x" && i+1 < len(args) {
 			return args[i+1]
 		}
+		if strings.HasPrefix(a, "-x") && len(a) > 2 && !strings.HasPrefix(a, "-x=") {
+			return strings.TrimPrefix(a, "-x")
+		}
 	}
 	return ""
 }
@@ -1236,4 +1185,29 @@ func preprocessedLangFlag(lang string) string {
 		return "c++-cpp-output"
 	}
 	return "cpp-output"
+}
+
+func joinedOutputArg(arg string) bool {
+	return isJoinedOutputArg(arg)
+}
+
+func joinedDependencyArg(arg string) bool {
+	return isJoinedDependencyArg(arg)
+}
+
+func joinedLangArg(arg string) bool {
+	return strings.HasPrefix(arg, "-x") && len(arg) > 2 && !strings.HasPrefix(arg, "-x=")
+}
+
+func isJoinedOutputArg(arg string) bool {
+	return strings.HasPrefix(arg, "-o") && len(arg) > 2
+}
+
+func isJoinedDependencyArg(arg string) bool {
+	for _, prefix := range []string{"-MF", "-MT", "-MQ"} {
+		if strings.HasPrefix(arg, prefix) && len(arg) > len(prefix) {
+			return true
+		}
+	}
+	return false
 }
