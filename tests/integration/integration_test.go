@@ -26,8 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"yadcc-go/internal/locald"
-	"yadcc-go/internal/remoted"
+	"yadcc-go/internal/daemon"
 	"yadcc-go/internal/scheduler"
 )
 
@@ -107,40 +106,52 @@ func isObjectFile(data []byte) bool {
 	return errThin == nil || errFat == nil
 }
 
-// TestFullStack_LocalOnly starts only a locald (no scheduler/remoted) and
+// startDaemon launches a unified daemon.Server in a goroutine and waits for it
+// to be ready.  Returns the HTTP (local) address.
+func startDaemon(t *testing.T, srv *daemon.Server) {
+	t.Helper()
+	go func() {
+		_ = srv.ListenAndServe()
+	}()
+	waitHTTP(t, srv.LocalAddr, 5*time.Second)
+}
+
+// TestFullStack_LocalOnly starts only a unified daemon (no scheduler) and
 // verifies that a C source file compiles to a valid object file via the
 // HTTP API.  This tests the local-fallback path.
 func TestFullStack_LocalOnly(t *testing.T) {
 	compilerPath := resolveCompiler(t)
 
-	localdAddr := freePort(t)
+	localAddr := freePort(t)
+	servantAddr := freePort(t)
 
-	srv := &locald.Server{
-		Addr:             localdAddr,
-		MaxLocalParallel: 2,
+	srv := &daemon.Server{
+		LocalAddr:   localAddr,
+		ServantAddr: servantAddr,
 		// No SchedulerAddr → pure local compile
 	}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil {
-			// Server stops when test process exits; ignore the error.
-		}
-	}()
-	waitHTTP(t, localdAddr, 5*time.Second)
+	startDaemon(t, srv)
 
 	t.Run("compile_hello_c", func(t *testing.T) {
-		runCompileTest(t, localdAddr, compilerPath, "c", helloC)
+		runCompileTest(t, localAddr, compilerPath, "c", helloC)
 	})
 }
 
-// TestFullStack_Remote starts scheduler + remoted + locald and compiles a C
+// TestFullStack_Remote starts scheduler + two unified daemons and compiles a C
 // source file through the full distributed path.
 func TestFullStack_Remote(t *testing.T) {
 	compilerPath := resolveCompiler(t)
 
 	schedulerGRPC := freePort(t)
 	schedulerHTTP := freePort(t)
-	remotedGRPC := freePort(t)
-	localdHTTP := freePort(t)
+
+	// Worker daemon (servant role).
+	workerLocalAddr := freePort(t)
+	workerServantAddr := freePort(t)
+
+	// Client daemon (local role, submits tasks).
+	clientLocalAddr := freePort(t)
+	clientServantAddr := freePort(t)
 
 	// 1. Start scheduler.
 	sched := &scheduler.Server{
@@ -148,45 +159,38 @@ func TestFullStack_Remote(t *testing.T) {
 		HTTPAddr: schedulerHTTP,
 	}
 	go sched.ListenAndServe() //nolint:errcheck
-
 	waitTCP(t, schedulerGRPC, 5*time.Second)
 
-	// 2. Start remoted worker.
+	// 2. Start worker daemon (registers as a servant with the scheduler).
 	workerID := fmt.Sprintf("test-worker-%d", os.Getpid())
-	worker := &remoted.Server{
-		GRPCAddr:      remotedGRPC,
-		SchedulerAddr: schedulerGRPC,
-		WorkerID:      workerID,
-		CompilerPath:  compilerPath,
-		Capacity:      4,
+	worker := &daemon.Server{
+		LocalAddr:       workerLocalAddr,
+		ServantAddr:     workerServantAddr,
+		SchedulerAddr:   schedulerGRPC,
+		ServantPriority: daemon.ServantPriorityDedicated,
+		WorkerID:        workerID,
 	}
-	go worker.ListenAndServe() //nolint:errcheck
+	startDaemon(t, worker)
 
-	waitTCP(t, remotedGRPC, 5*time.Second)
-
-	// Give remoted time to send its first heartbeat so the scheduler
-	// has at least one registered worker before we submit tasks.
+	// Give worker time to send its first heartbeat so the scheduler has at
+	// least one registered worker before we submit tasks.
 	time.Sleep(300 * time.Millisecond)
 
-	// 3. Start locald.
-	local := &locald.Server{
-		Addr:             localdHTTP,
-		SchedulerAddr:    schedulerGRPC,
-		MaxLocalParallel: 2,
+	// 3. Start client daemon.
+	client := &daemon.Server{
+		LocalAddr:     clientLocalAddr,
+		ServantAddr:   clientServantAddr,
+		SchedulerAddr: schedulerGRPC,
 	}
-	go local.ListenAndServe() //nolint:errcheck
-
-	waitHTTP(t, localdHTTP, 5*time.Second)
+	startDaemon(t, client)
 
 	t.Run("compile_hello_c_remote", func(t *testing.T) {
-		runCompileTest(t, localdHTTP, compilerPath, "c", helloC)
+		runCompileTest(t, clientLocalAddr, compilerPath, "c", helloC)
 	})
 
 	if runtime.GOOS != "darwin" {
-		// clang on macOS reports -x c++ when compiling C++ via -x c++-cpp-output;
-		// the test works but skip on macOS CI to keep it simple.
 		t.Run("compile_hello_cpp_remote", func(t *testing.T) {
-			runCompileTest(t, localdHTTP, compilerPath, "c++", helloCPP)
+			runCompileTest(t, clientLocalAddr, compilerPath, "c++", helloCPP)
 		})
 	}
 }
@@ -195,14 +199,15 @@ func TestFullStack_Remote(t *testing.T) {
 // cache hit (CacheHit=true in the response).
 func TestFullStack_CacheHit(t *testing.T) {
 	compilerPath := resolveCompiler(t)
-	localdAddr := freePort(t)
 
-	srv := &locald.Server{
-		Addr:             localdAddr,
-		MaxLocalParallel: 2,
+	localAddr := freePort(t)
+	servantAddr := freePort(t)
+
+	srv := &daemon.Server{
+		LocalAddr:   localAddr,
+		ServantAddr: servantAddr,
 	}
-	go srv.ListenAndServe() //nolint:errcheck
-	waitHTTP(t, localdAddr, 5*time.Second)
+	startDaemon(t, srv)
 
 	// Preprocess once so both submits use the exact same preprocessed bytes
 	// (and therefore the same cache key).
@@ -220,8 +225,8 @@ func TestFullStack_CacheHit(t *testing.T) {
 	compilerArgs := []string{"-c", "-x", "c", srcFile, "-o", srcFile + ".o"}
 	defer os.Remove(srcFile + ".o")
 
-	submit := func() locald.SubmitResponse {
-		reqBody, _ := json.Marshal(locald.SubmitRequest{
+	submit := func() daemon.SubmitResponse {
+		reqBody, _ := json.Marshal(daemon.SubmitRequest{
 			CompilerPath:       compilerPath,
 			Args:               compilerArgs,
 			Language:           "c",
@@ -231,14 +236,14 @@ func TestFullStack_CacheHit(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-			"http://"+localdAddr+"/local/submit_task", bytes.NewReader(reqBody))
+			"http://"+localAddr+"/local/submit_task", bytes.NewReader(reqBody))
 		httpReq.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(httpReq)
 		if err != nil {
 			t.Fatalf("POST: %v", err)
 		}
 		defer resp.Body.Close()
-		var result locald.SubmitResponse
+		var result daemon.SubmitResponse
 		json.NewDecoder(resp.Body).Decode(&result) //nolint:errcheck
 		return result
 	}
@@ -262,9 +267,9 @@ func TestFullStack_CacheHit(t *testing.T) {
 // ---------- helpers ----------
 
 // runCompileTest submits a compile request and asserts success + valid object.
-func runCompileTest(t *testing.T, localdAddr, compilerPath, lang, src string) {
+func runCompileTest(t *testing.T, localAddr, compilerPath, lang, src string) {
 	t.Helper()
-	result := submitCompile(t, localdAddr, compilerPath, lang, src)
+	result := submitCompile(t, localAddr, compilerPath, lang, src)
 	if result.ExitCode != 0 {
 		t.Fatalf("compile failed exit=%d\nstdout: %s\nstderr: %s",
 			result.ExitCode, result.Stdout, result.Stderr)
@@ -278,11 +283,10 @@ func runCompileTest(t *testing.T, localdAddr, compilerPath, lang, src string) {
 	t.Logf("object file size: %d bytes  cache_hit: %v", len(result.ObjectFile), result.CacheHit)
 }
 
-// submitCompile preprocesses src and POSTs it to locald, returning the response.
-func submitCompile(t *testing.T, localdAddr, compilerPath, lang, src string) locald.SubmitResponse {
+// submitCompile preprocesses src and POSTs it to the daemon, returning the response.
+func submitCompile(t *testing.T, localAddr, compilerPath, lang, src string) daemon.SubmitResponse {
 	t.Helper()
 
-	// Write source to a temp file so we can preprocess it.
 	ext := ".c"
 	if strings.Contains(lang, "++") || lang == "c++" {
 		ext = ".cpp"
@@ -304,10 +308,9 @@ func submitCompile(t *testing.T, localdAddr, compilerPath, lang, src string) loc
 	}
 	preprocessed := ppOut.Bytes()
 
-	// Build compiler args (as if the wrapper had produced them).
 	compilerArgs := []string{"-c", "-x", lang, srcFile, "-o", outFile}
 
-	reqBody, err := json.Marshal(locald.SubmitRequest{
+	reqBody, err := json.Marshal(daemon.SubmitRequest{
 		CompilerPath:       compilerPath,
 		Args:               compilerArgs,
 		Language:           lang,
@@ -322,7 +325,7 @@ func submitCompile(t *testing.T, localdAddr, compilerPath, lang, src string) loc
 	defer cancel()
 
 	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://"+localdAddr+"/local/submit_task",
+		"http://"+localAddr+"/local/submit_task",
 		bytes.NewReader(reqBody))
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -338,7 +341,7 @@ func submitCompile(t *testing.T, localdAddr, compilerPath, lang, src string) loc
 		t.Fatalf("submit_task returned HTTP %d: %s", resp.StatusCode, buf.String())
 	}
 
-	var result locald.SubmitResponse
+	var result daemon.SubmitResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -397,21 +400,19 @@ func resolveCompilerCPP(t *testing.T) string {
 
 // TestFullStack_CPP_LocalOnly tests C++ local compilation.
 func TestFullStack_CPP_LocalOnly(t *testing.T) {
-	_ = resolveCompiler(t) // ensure a compiler exists
+	_ = resolveCompiler(t)
 	compilerPath := resolveCompilerCPP(t)
 
-	localdAddr := freePort(t)
-	srv := &locald.Server{
-		Addr:             localdAddr,
-		MaxLocalParallel: 2,
+	localAddr := freePort(t)
+	servantAddr := freePort(t)
+	srv := &daemon.Server{
+		LocalAddr:   localAddr,
+		ServantAddr: servantAddr,
 	}
-	go srv.ListenAndServe() //nolint:errcheck
-	waitHTTP(t, localdAddr, 5*time.Second)
+	startDaemon(t, srv)
 
-	runCompileTest(t, localdAddr, compilerPath, "c++", helloCPP)
+	runCompileTest(t, localAddr, compilerPath, "c++", helloCPP)
 }
-
-// ---------- script-based test (optional) ----------
 
 // TestScript_BuildAndRun builds the binaries and runs a real compile using the
 // yadcc wrapper binary.  It requires the binaries to be pre-built in bin/.
@@ -431,8 +432,10 @@ func TestScript_BuildAndRun(t *testing.T) {
 
 	schedGRPC := freePort(t)
 	schedHTTP := freePort(t)
-	remotedPort := freePort(t)
-	localdPort := freePort(t)
+	workerLocalPort := freePort(t)
+	workerServantPort := freePort(t)
+	clientLocalPort := freePort(t)
+	clientServantPort := freePort(t)
 
 	// Start scheduler process.
 	schedCmd := exec.Command(schedulerBin, "-addr="+schedGRPC, "-http-addr="+schedHTTP)
@@ -444,36 +447,35 @@ func TestScript_BuildAndRun(t *testing.T) {
 	t.Cleanup(func() { schedCmd.Process.Kill() })
 	waitTCP(t, schedGRPC, 5*time.Second)
 
-	// Start remoted worker process.
+	// Start worker daemon process.
 	workerCmd := exec.Command(daemonBin,
-		"-mode=remote",
-		"-addr=127.0.0.1:"+strings.Split(remotedPort, ":")[1],
-		"-scheduler="+schedGRPC,
-		"-compiler="+compilerPath,
-		"-capacity=2",
+		"--local_addr="+workerLocalPort,
+		"--servant_addr=127.0.0.1:"+strings.Split(workerServantPort, ":")[1],
+		"--scheduler_uri="+schedGRPC,
+		"--servant_priority=dedicated",
 	)
 	workerCmd.Stdout = os.Stdout
 	workerCmd.Stderr = os.Stderr
 	if err := workerCmd.Start(); err != nil {
-		t.Fatalf("start remoted: %v", err)
+		t.Fatalf("start worker daemon: %v", err)
 	}
 	t.Cleanup(func() { workerCmd.Process.Kill() })
-	waitTCP(t, remotedPort, 5*time.Second)
-	time.Sleep(400 * time.Millisecond) // let first heartbeat arrive
+	waitHTTP(t, workerLocalPort, 5*time.Second)
+	time.Sleep(400 * time.Millisecond)
 
-	// Start locald process.
-	localCmd := exec.Command(daemonBin,
-		"-mode=local",
-		"-addr=127.0.0.1:"+strings.Split(localdPort, ":")[1],
-		"-scheduler="+schedGRPC,
+	// Start client daemon process.
+	clientCmd := exec.Command(daemonBin,
+		"--local_addr="+clientLocalPort,
+		"--servant_addr="+clientServantPort,
+		"--scheduler_uri="+schedGRPC,
 	)
-	localCmd.Stdout = os.Stdout
-	localCmd.Stderr = os.Stderr
-	if err := localCmd.Start(); err != nil {
-		t.Fatalf("start locald: %v", err)
+	clientCmd.Stdout = os.Stdout
+	clientCmd.Stderr = os.Stderr
+	if err := clientCmd.Start(); err != nil {
+		t.Fatalf("start client daemon: %v", err)
 	}
-	t.Cleanup(func() { localCmd.Process.Kill() })
-	waitHTTP(t, localdPort, 5*time.Second)
+	t.Cleanup(func() { clientCmd.Process.Kill() })
+	waitHTTP(t, clientLocalPort, 5*time.Second)
 
 	// Write a temp C source file and compile it via the wrapper.
 	srcFile := writeTempFile(t, "yadcc-script-*.c", []byte(helloC))
@@ -481,8 +483,8 @@ func TestScript_BuildAndRun(t *testing.T) {
 	outFile := srcFile + ".o"
 	defer os.Remove(outFile)
 
-	env := append(os.Environ(), "YADCC_DAEMON_ADDR=http://127.0.0.1:"+strings.Split(localdPort, ":")[1])
-	compileCmd := exec.Command(yadccBin, "-c", "-x", "c", srcFile, "-o", outFile)
+	env := append(os.Environ(), "YADCC_DAEMON_ADDR=http://"+clientLocalPort)
+	compileCmd := exec.Command(yadccBin, compilerPath, "-c", "-x", "c", srcFile, "-o", outFile)
 	compileCmd.Env = env
 	compileCmd.Stdout = os.Stdout
 	compileCmd.Stderr = os.Stderr

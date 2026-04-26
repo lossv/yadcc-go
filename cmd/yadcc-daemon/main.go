@@ -2,85 +2,57 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log/slog"
 	"os"
 
-	"yadcc-go/internal/locald"
-	"yadcc-go/internal/remoted"
+	"yadcc-go/internal/daemon"
 )
 
 func main() {
-	mode := flag.String("mode", "local", "daemon mode: local (wrapper-facing) or remote (worker)")
-
-	// shared
-	addr := flag.String("addr", "", "listen address (default depends on mode)")
-	schedulerAddr := flag.String("scheduler", "127.0.0.1:8336", "scheduler gRPC address")
-
-	// local daemon flags
-	cacheAddr := flag.String("cache", "", "cache service address (empty = in-process memory)")
-	maxLocal := flag.Int("max-local", 8, "max concurrent local fallback compilations")
-
-	// remote worker flags
-	workerID := flag.String("worker-id", "", "worker unique ID (defaults to hostname:port)")
-	compilerPath := flag.String("compiler", "", "compiler binary path on this machine (remote mode)")
-	capacity := flag.Int("capacity", 4, "max concurrent compile tasks (remote mode)")
+	localAddr := flag.String("local_addr", "127.0.0.1:8334",
+		"HTTP listen address for wrapper-facing API (loopback)")
+	servantAddr := flag.String("servant_addr", "0.0.0.0:8335",
+		"gRPC listen address for remote compilation tasks")
+	schedulerURI := flag.String("scheduler_uri", "",
+		"scheduler gRPC address, e.g. 10.0.0.1:8336 (empty = no distributed compilation)")
+	cacheAddr := flag.String("cache_addr", "",
+		"yadcc-cache gRPC address (empty = in-process L1 memory cache only)")
+	token := flag.String("token", "yadcc",
+		"authentication token for scheduler and cache")
+	servantPriority := flag.String("servant_priority", "user",
+		"CPU allocation for remote tasks: user (~40% CPUs) or dedicated (~95% CPUs)")
+	workerID := flag.String("worker_id", "",
+		"unique worker identifier (default: hostname:servant_port)")
 
 	flag.Parse()
 
-	switch *mode {
-	case "local":
-		listenAddr := *addr
-		if listenAddr == "" {
-			listenAddr = "127.0.0.1:8334"
-		}
-		slog.Info("starting yadcc-daemon (local mode)", "addr", listenAddr, "scheduler", *schedulerAddr)
-		srv := locald.Server{
-			Addr:             listenAddr,
-			SchedulerAddr:    *schedulerAddr,
-			CacheAddr:        *cacheAddr,
-			MaxLocalParallel: *maxLocal,
-		}
-		if err := srv.ListenAndServe(); err != nil {
-			slog.Error("daemon stopped", "error", err)
-			os.Exit(1)
-		}
-
-	case "remote":
-		listenAddr := *addr
-		if listenAddr == "" {
-			listenAddr = "0.0.0.0:8335"
-		}
-		id := *workerID
-		if id == "" {
-			hostname, _ := os.Hostname()
-			id = fmt.Sprintf("%s:%s", hostname, portOf(listenAddr))
-		}
-		slog.Info("starting yadcc-daemon (remote worker mode)",
-			"addr", listenAddr, "id", id, "scheduler", *schedulerAddr)
-		srv := remoted.Server{
-			GRPCAddr:      listenAddr,
-			SchedulerAddr: *schedulerAddr,
-			WorkerID:      id,
-			CompilerPath:  *compilerPath,
-			Capacity:      uint32(*capacity),
-		}
-		if err := srv.ListenAndServe(); err != nil {
-			slog.Error("worker stopped", "error", err)
-			os.Exit(1)
-		}
-
+	var prio daemon.ServantPriority
+	switch *servantPriority {
+	case "dedicated":
+		prio = daemon.ServantPriorityDedicated
 	default:
-		slog.Error("unknown mode", "mode", *mode)
+		prio = daemon.ServantPriorityUser
+	}
+
+	srv := &daemon.Server{
+		LocalAddr:       *localAddr,
+		ServantAddr:     *servantAddr,
+		SchedulerAddr:   *schedulerURI,
+		CacheAddr:       *cacheAddr,
+		Token:           *token,
+		ServantPriority: prio,
+		WorkerID:        *workerID,
+	}
+
+	slog.Info("starting yadcc-daemon",
+		"local_addr", *localAddr,
+		"servant_addr", *servantAddr,
+		"scheduler_uri", *schedulerURI,
+		"servant_priority", *servantPriority,
+	)
+
+	if err := srv.ListenAndServe(); err != nil {
+		slog.Error("daemon stopped", "error", err)
 		os.Exit(1)
 	}
-}
-
-func portOf(addr string) string {
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[i+1:]
-		}
-	}
-	return addr
 }

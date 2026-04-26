@@ -6,3 +6,4 @@ coverage.out
 *.log
 tmp/
 .gocache/
+yadcc-daemon
