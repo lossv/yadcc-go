@@ -1231,39 +1231,30 @@ func normalizeArgs(args []string) []string {
 }
 
 // buildLocalArgs builds compiler args for local execution from a preprocessed file.
+// It uses compiler.Parse so that two-word options (e.g. -arch arm64, -isysroot ...)
+// are correctly preserved; the old raw-string loop silently dropped their values.
 func buildLocalArgs(originalArgs []string, lang, tmpFile, outputFile string) []string {
-	skip := false
-	hasOutput := false
+	parsed := compiler.Parse(originalArgs)
 	var args []string
-	for i, a := range originalArgs {
-		if skip {
-			skip = false
-			continue
-		}
-		if len(a) == 0 || a[0] != '-' {
-			continue
-		}
-		switch {
-		case a == "-o":
-			if i+1 < len(originalArgs) {
-				skip = true
-			}
+	hasOutput := false
+	for _, opt := range parsed.Options() {
+		switch opt.Key {
+		case "-o":
 			args = append(args, "-o", outputFile)
 			hasOutput = true
-		case joinedOutputArg(a):
-			args = append(args, "-o", outputFile)
-			hasOutput = true
-		case a == "-x":
-			if i+1 < len(originalArgs) {
-				skip = true
-			}
-		case joinedLangArg(a):
-		case a == "-E" || a == "-fdirectives-only" || a == "-MD" || a == "-MMD" || a == "-MP" || a == "-MG":
-		case a == "-MF" || a == "-MT" || a == "-MQ":
-			skip = true
-		case joinedDependencyArg(a):
+		case "-x":
+			// will be replaced by the -x cpp-output below
+		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
+			// strip preprocessor / dependency flags
+		case "-MF", "-MT", "-MQ":
+			// strip dependency target/file flags (and their values)
 		default:
-			args = append(args, a)
+			if opt.Joined && len(opt.Values) == 1 {
+				args = append(args, opt.Key+opt.JoinSep+opt.Values[0])
+			} else {
+				args = append(args, opt.Key)
+				args = append(args, opt.Values...)
+			}
 		}
 	}
 	if !hasOutput {
@@ -1276,41 +1267,47 @@ func buildLocalArgs(originalArgs []string, lang, tmpFile, outputFile string) []s
 	return result
 }
 
+// remoteStripPrefix reports whether an option key should be stripped when
+// sending args to a remote servant.  These flags reference local include paths
+// that don't exist on the remote machine; the preprocessed source already
+// has the headers inlined so they are not needed.
+// This mirrors C++ kIgnoredArgPrefixes in compilation_saas.cc.
+func remoteStripPrefix(key string) bool {
+	switch key {
+	case "-I", "-include", "-isystem", "-Wmissing-include-dirs",
+		"-Wp,-MMD", "-Wp,-MF", "-Wp,-MD", "-Wp,-MP":
+		return true
+	}
+	return false
+}
+
 // buildCompileArgs adapts original args for remote execution from a preprocessed file.
+// Include-path flags (-I, -include, -isystem, -Wmissing-include-dirs) are
+// stripped because the remote machine's filesystem layout differs; the source
+// has already been preprocessed so the headers are inlined.
 func buildCompileArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
-	lang := inferLang(originalArgs)
-	skip := false
-	hasOutput := false
+	parsed := compiler.Parse(originalArgs)
+	lang, _ := parsed.Language()
 	var args []string
-	for i, a := range originalArgs {
-		if skip {
-			skip = false
-			continue
-		}
-		if len(a) == 0 || a[0] != '-' {
-			continue
-		}
-		switch {
-		case a == "-o":
-			if i+1 < len(originalArgs) {
-				skip = true
-			}
+	hasOutput := false
+	for _, opt := range parsed.Options() {
+		switch opt.Key {
+		case "-o":
 			args = append(args, "-o", tmpOut)
 			hasOutput = true
-		case joinedOutputArg(a):
-			args = append(args, "-o", tmpOut)
-			hasOutput = true
-		case a == "-x":
-			if i+1 < len(originalArgs) {
-				skip = true
-			}
-		case joinedLangArg(a):
-		case a == "-E" || a == "-fdirectives-only" || a == "-MD" || a == "-MMD" || a == "-MP" || a == "-MG":
-		case a == "-MF" || a == "-MT" || a == "-MQ":
-			skip = true
-		case joinedDependencyArg(a):
+		case "-x":
+		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
+		case "-MF", "-MT", "-MQ":
 		default:
-			args = append(args, a)
+			if remoteStripPrefix(opt.Key) {
+				continue
+			}
+			if opt.Joined && len(opt.Values) == 1 {
+				args = append(args, opt.Key+opt.JoinSep+opt.Values[0])
+			} else {
+				args = append(args, opt.Key)
+				args = append(args, opt.Values...)
+			}
 		}
 	}
 	if !hasOutput {
@@ -1340,18 +1337,6 @@ func preprocessedLangFlag(lang string) string {
 		return "c++-cpp-output"
 	}
 	return "cpp-output"
-}
-
-func joinedOutputArg(arg string) bool {
-	return isJoinedOutputArg(arg)
-}
-
-func joinedDependencyArg(arg string) bool {
-	return isJoinedDependencyArg(arg)
-}
-
-func joinedLangArg(arg string) bool {
-	return strings.HasPrefix(arg, "-x") && len(arg) > 2 && !strings.HasPrefix(arg, "-x=")
 }
 
 func isJoinedOutputArg(arg string) bool {

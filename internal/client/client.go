@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"yadcc-go/internal/compiler"
 	"yadcc-go/internal/platform"
+	"yadcc-go/internal/quota"
 )
 
 const submitTimeout = 60 * time.Second
@@ -58,6 +60,18 @@ func Run(argv []string) int {
 // It preprocesses the source locally, then submits to the daemon.
 // Returns (exitCode, nil) on success, or (0, error) to trigger local fallback.
 func tryDistributed(compilerPath string, compilerArgs []string, parsedArgs compiler.Args) (int, error) {
+	// Acquire a task slot from the process-local quota limiter before we
+	// preprocess.  This mirrors C++ AcquireTaskQuota() in task_quota.cc and
+	// prevents the wrapper from flooding the daemon when many files are being
+	// compiled in parallel (e.g. make -j128).
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := quota.Acquire(ctx); err != nil {
+		// Timed out waiting for a quota slot — fall back to local.
+		return 0, fmt.Errorf("quota acquire: %w", err)
+	}
+	defer quota.Release()
+
 	// Step 1: preprocess locally.
 	ppResult, err := compiler.Preprocess(compilerPath, parsedArgs)
 	if err != nil {

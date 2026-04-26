@@ -13,6 +13,14 @@ type Args struct {
 type Option struct {
 	Key    string
 	Values []string
+	// Joined is true when the original argument was written as key+value with no
+	// space (e.g. "-std=gnu11", "-DFOO", "-Iinclude").  When reconstructing the
+	// argument list (e.g. for preprocessing) these must be emitted as a single
+	// token "key+sep+value" rather than two separate tokens "key" "value".
+	Joined bool
+	// JoinSep is the separator between Key and Value when Joined is true.
+	// Typically "" (e.g. "-DFOO", "-Idir") or "=" (e.g. "-std=gnu11").
+	JoinSep string
 }
 
 var oneValueOptions = map[string]struct{}{
@@ -162,15 +170,15 @@ func splitJoinedOption(arg string) (Option, bool) {
 		}
 		switch prefix {
 		case "-std=", "-stdlib=", "--sysroot=", "-isysroot=", "-target=":
-			return Option{Key: strings.TrimSuffix(prefix, "="), Values: []string{strings.TrimPrefix(arg, prefix)}}, true
+			return Option{Key: strings.TrimSuffix(prefix, "="), Values: []string{strings.TrimPrefix(arg, prefix)}, Joined: true, JoinSep: "="}, true
 		case "-x":
 			value := strings.TrimPrefix(arg, prefix)
 			if strings.HasPrefix(value, "=") {
 				return Option{}, false
 			}
-			return Option{Key: prefix, Values: []string{value}}, true
+			return Option{Key: prefix, Values: []string{value}, Joined: true, JoinSep: ""}, true
 		default:
-			return Option{Key: prefix, Values: []string{strings.TrimPrefix(arg, prefix)}}, true
+			return Option{Key: prefix, Values: []string{strings.TrimPrefix(arg, prefix)}, Joined: true, JoinSep: ""}, true
 		}
 	}
 	return Option{}, false
@@ -178,6 +186,28 @@ func splitJoinedOption(arg string) (Option, bool) {
 
 func (a Args) Files() []string {
 	return append([]string(nil), a.files...)
+}
+
+// Options returns a copy of the parsed option list.
+func (a Args) Options() []Option {
+	return append([]Option(nil), a.options...)
+}
+
+// Tokens reconstructs the flat argument list from the parsed options and files.
+// Joined options are emitted as a single token (e.g. "-std=gnu11", "-DFOO").
+// Space-separated options are emitted as two tokens (e.g. "-arch", "arm64").
+func (a Args) Tokens() []string {
+	var out []string
+	for _, opt := range a.options {
+		if opt.Joined && len(opt.Values) == 1 {
+			out = append(out, opt.Key+opt.JoinSep+opt.Values[0])
+		} else {
+			out = append(out, opt.Key)
+			out = append(out, opt.Values...)
+		}
+	}
+	out = append(out, a.files...)
+	return out
 }
 
 // SourceFile returns the single source file argument, or "" if not exactly one.

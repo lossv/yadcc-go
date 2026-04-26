@@ -82,7 +82,8 @@ func TestBuildPreprocessArgsKeepsDependencyFlags(t *testing.T) {
 	args := Parse([]string{"-c", "-MD", "-MF", "hello.d", "-MTtarget", "-Iinclude", "hello.c", "-o", "hello.o"})
 	got := buildPreprocessArgs(args, "c", "hello.c")
 
-	for _, want := range []string{"-MD", "-MF", "hello.d", "-MT", "target", "-I", "include", "-E", "-o", "-"} {
+	// Joined options are emitted as single tokens (e.g. "-MTtarget", "-Iinclude").
+	for _, want := range []string{"-MD", "-MF", "hello.d", "-MTtarget", "-Iinclude", "-E", "-o", "-"} {
 		if !contains(got, want) {
 			t.Fatalf("buildPreprocessArgs missing %q in %v", want, got)
 		}

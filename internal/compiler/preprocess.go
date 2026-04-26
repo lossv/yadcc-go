@@ -58,12 +58,16 @@ func Preprocess(compilerPath string, a Args) (PreprocessResult, error) {
 }
 
 // buildPreprocessArgs returns the argument list for a -E invocation based on
-// the original compile args. It strips compilation-only flags (-c, -o) and
-// keeps -MD/-MMD/-MF/-MT/-MQ so build systems still receive dependency files
-// from the local preprocessing step.
+// the original compile args. It strips compilation-only flags (-c, -o,
+// -fworking-directory) and adds -fno-working-directory so that line-marker
+// paths in the preprocessed output are CWD-independent (matching the C++
+// reference behaviour in rewrite_file.cc). Dependency flags (-MD/-MF/-MT/-MQ)
+// are kept so build systems still receive dependency files from the local
+// preprocessing step.
 func buildPreprocessArgs(a Args, lang string, inputFile string) []string {
 	skipKeys := map[string]bool{
 		"-c": true, "-o": true,
+		"-fworking-directory": true,
 	}
 
 	var args []string
@@ -71,9 +75,18 @@ func buildPreprocessArgs(a Args, lang string, inputFile string) []string {
 		if skipKeys[opt.Key] {
 			continue
 		}
-		args = append(args, opt.Key)
-		args = append(args, opt.Values...)
+		if opt.Joined && len(opt.Values) == 1 {
+			// Reconstruct as a single token (e.g. "-std=gnu11", "-DFOO", "-Idir").
+			args = append(args, opt.Key+opt.JoinSep+opt.Values[0])
+		} else {
+			args = append(args, opt.Key)
+			args = append(args, opt.Values...)
+		}
 	}
+
+	// Always emit CWD-independent line markers so the preprocessed source can
+	// be compiled on a remote machine without CWD matching.
+	args = append(args, "-fno-working-directory")
 
 	// Ensure -x is explicit so the preprocessor knows the language.
 	if !a.Has("-x") {

@@ -13,6 +13,11 @@
 #   5. Rebuilds (after `make clean`) to verify cache hits.
 #   6. Stops the yadcc stack.
 #
+# Verification (the key assertions this script makes):
+#   A. Wrapper was actually invoked by cmake — checked via a touch-file sentinel.
+#   B. Daemon received at least one compile task — checked via Prometheus metrics.
+#   C. Second build produced cache hits — checked via Prometheus metrics.
+#
 # Prerequisites: cmake, a system C/C++ compiler (gcc or clang), curl.
 set -euo pipefail
 
@@ -37,6 +42,41 @@ export YADCC_SCHEDULER_HTTP_ADDR="$SCHED_HTTP"
 export YADCC_DAEMON_LOCAL_ADDR="$DAEMON_LOCAL"
 export YADCC_DAEMON_SERVANT_ADDR="$DAEMON_SERVANT"
 export YADCC_DAEMON_PRIORITY="dedicated"
+
+# Sentinel file written by the wrapper scripts on every invocation.
+# After the build we assert it exists to confirm cmake actually called yadcc.
+WRAPPER_INVOKED_SENTINEL="$LOG_DIR/wrapper_was_invoked"
+
+# ---------- metric helpers ----------
+
+# read_metric <metric_name> <label_filter>
+#   Reads the current value of a Prometheus counter/gauge from the daemon's
+#   /metrics endpoint.  Returns 0 if the series does not exist yet.
+#   <label_filter> is a literal substring to match inside the {} labels,
+#   e.g. 'outcome="remote"'.
+read_metric() {
+    local name="$1" label="$2"
+    curl -sf "http://$DAEMON_LOCAL/metrics" 2>/dev/null \
+        | awk -v name="$name" -v label="$label" '
+            /^#/ { next }
+            $0 ~ name && $0 ~ label { val=$NF }
+            END { printf "%d\n", (val+0) }
+        '
+}
+
+# assert_metric_gt <metric_name> <label_filter> <threshold> <description>
+#   Fails the script if the metric value is not strictly greater than threshold.
+assert_metric_gt() {
+    local name="$1" label="$2" threshold="$3" desc="$4"
+    local val
+    val="$(read_metric "$name" "$label")"
+    if (( val > threshold )); then
+        echo "[ok]   $desc : $val (> $threshold)"
+    else
+        echo "[FAIL] $desc : got $val, expected > $threshold" >&2
+        exit 1
+    fi
+}
 
 # Portable millisecond timestamp (Linux gnu date supports %3N; macOS BSD does not).
 now_ms() {
@@ -98,6 +138,7 @@ mkdir -p "$WRAPPER_DIR"
 
 cat >"$WRAPPER_DIR/cc" <<WEOF
 #!/usr/bin/env bash
+touch "$WRAPPER_INVOKED_SENTINEL"
 export YADCC_DAEMON_ADDR="http://$DAEMON_LOCAL"
 exec "$YADCC_BIN" "$REAL_CC" "\$@"
 WEOF
@@ -105,6 +146,7 @@ chmod +x "$WRAPPER_DIR/cc"
 
 cat >"$WRAPPER_DIR/c++" <<WEOF
 #!/usr/bin/env bash
+touch "$WRAPPER_INVOKED_SENTINEL"
 export YADCC_DAEMON_ADDR="http://$DAEMON_LOCAL"
 exec "$YADCC_BIN" "$REAL_CXX" "\$@"
 WEOF
@@ -129,6 +171,43 @@ T1="$(now_ms)"
 FIRST_MS=$(( T1 - T0 ))
 echo "[info] First build took ${FIRST_MS} ms"
 
+# ---------- Assertion A: wrapper was actually invoked ----------
+echo ""
+echo "==> Verifying wrapper was invoked by cmake..."
+if [[ -f "$WRAPPER_INVOKED_SENTINEL" ]]; then
+    echo "[ok]   Wrapper sentinel file exists — cmake called yadcc wrapper"
+else
+    echo "[FAIL] Wrapper sentinel file missing — cmake did NOT call the yadcc wrapper" >&2
+    exit 1
+fi
+
+# ---------- Assertion B: daemon received compile tasks ----------
+echo ""
+echo "==> Verifying daemon processed compile tasks..."
+# At least one task must have reached the daemon (remote, local fallback, or cache).
+# We sum remote + local + cache outcomes by checking each; any non-zero count is enough.
+TASKS_REMOTE="$(read_metric "yadcc_daemon_tasks_total" 'outcome="remote"')"
+TASKS_LOCAL="$(read_metric  "yadcc_daemon_tasks_total" 'outcome="local"')"
+TASKS_L1="$(read_metric     "yadcc_daemon_tasks_total" 'outcome="cache_hit_l1"')"
+TASKS_L2="$(read_metric     "yadcc_daemon_tasks_total" 'outcome="cache_hit_l2"')"
+TASKS_TOTAL=$(( TASKS_REMOTE + TASKS_LOCAL + TASKS_L1 + TASKS_L2 ))
+
+echo "[info] daemon tasks — remote:${TASKS_REMOTE} local:${TASKS_LOCAL} cache_l1:${TASKS_L1} cache_l2:${TASKS_L2}"
+if (( TASKS_TOTAL == 0 )); then
+    echo "[FAIL] Daemon received zero compile tasks — wrapper did not reach daemon" >&2
+    exit 1
+fi
+echo "[ok]   Daemon received ${TASKS_TOTAL} task(s) in first build"
+
+# If a scheduler is running the single unified daemon acts as both client and
+# worker, so remote tasks should be > 0.  On a single-node setup where the
+# daemon has no scheduler, all tasks will be local — both are valid.
+if (( TASKS_REMOTE > 0 )); then
+    echo "[ok]   Remote path used (tasks dispatched via scheduler)"
+else
+    echo "[warn] No remote tasks — daemon ran all compilations locally (no scheduler available or tasks not distributable)"
+fi
+
 # ---------- 5. Run tests ----------
 echo ""
 echo "==> Running ctest..."
@@ -146,9 +225,19 @@ T3="$(now_ms)"
 SECOND_MS=$(( T3 - T2 ))
 echo "[info] Second build took ${SECOND_MS} ms"
 
+# ---------- Assertion C: second build used cache ----------
+echo ""
+echo "==> Verifying second build produced cache hits..."
+assert_metric_gt \
+    "yadcc_daemon_tasks_total" 'outcome="cache_hit_l1"' 0 \
+    "L1 cache hits in second build"
+
 echo ""
 echo "============================================"
 echo " CMake test PASSED"
 echo "   First build  : ${FIRST_MS} ms  (cache cold)"
 echo "   Second build : ${SECOND_MS} ms  (cache warm)"
+echo "   Wrapper invoked    : yes"
+echo "   Daemon tasks total : ${TASKS_TOTAL}"
+echo "   L1 cache hits (2nd): $(read_metric "yadcc_daemon_tasks_total" 'outcome="cache_hit_l1"')"
 echo "============================================"

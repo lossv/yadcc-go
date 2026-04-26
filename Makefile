@@ -1,4 +1,5 @@
 GOCACHE ?= $(CURDIR)/.gocache
+BIN     ?= $(CURDIR)/bin
 
 .PHONY: fmt
 fmt:
@@ -10,7 +11,10 @@ test:
 
 .PHONY: build
 build:
-	GOCACHE=$(GOCACHE) go build ./...
+	GOCACHE=$(GOCACHE) go build -o $(BIN)/yadcc           ./cmd/yadcc/
+	GOCACHE=$(GOCACHE) go build -o $(BIN)/yadcc-daemon    ./cmd/yadcc-daemon/
+	GOCACHE=$(GOCACHE) go build -o $(BIN)/yadcc-scheduler ./cmd/yadcc-scheduler/
+	GOCACHE=$(GOCACHE) go build -o $(BIN)/yadcc-cache     ./cmd/yadcc-cache/
 
 .PHONY: proto-gen
 proto-gen:
