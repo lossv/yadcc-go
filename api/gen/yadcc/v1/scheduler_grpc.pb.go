@@ -23,6 +23,7 @@ const (
 	SchedulerService_WaitForStartingTask_FullMethodName = "/yadcc.v1.SchedulerService/WaitForStartingTask"
 	SchedulerService_KeepTaskAlive_FullMethodName       = "/yadcc.v1.SchedulerService/KeepTaskAlive"
 	SchedulerService_FreeTask_FullMethodName            = "/yadcc.v1.SchedulerService/FreeTask"
+	SchedulerService_GetRunningTasks_FullMethodName     = "/yadcc.v1.SchedulerService/GetRunningTasks"
 )
 
 // SchedulerServiceClient is the client API for SchedulerService service.
@@ -33,6 +34,7 @@ type SchedulerServiceClient interface {
 	WaitForStartingTask(ctx context.Context, in *WaitForStartingTaskRequest, opts ...grpc.CallOption) (*WaitForStartingTaskResponse, error)
 	KeepTaskAlive(ctx context.Context, in *KeepTaskAliveRequest, opts ...grpc.CallOption) (*KeepTaskAliveResponse, error)
 	FreeTask(ctx context.Context, in *FreeTaskRequest, opts ...grpc.CallOption) (*FreeTaskResponse, error)
+	GetRunningTasks(ctx context.Context, in *GetRunningTasksRequest, opts ...grpc.CallOption) (*GetRunningTasksResponse, error)
 }
 
 type schedulerServiceClient struct {
@@ -83,6 +85,16 @@ func (c *schedulerServiceClient) FreeTask(ctx context.Context, in *FreeTaskReque
 	return out, nil
 }
 
+func (c *schedulerServiceClient) GetRunningTasks(ctx context.Context, in *GetRunningTasksRequest, opts ...grpc.CallOption) (*GetRunningTasksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRunningTasksResponse)
+	err := c.cc.Invoke(ctx, SchedulerService_GetRunningTasks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SchedulerServiceServer is the server API for SchedulerService service.
 // All implementations must embed UnimplementedSchedulerServiceServer
 // for forward compatibility.
@@ -91,6 +103,7 @@ type SchedulerServiceServer interface {
 	WaitForStartingTask(context.Context, *WaitForStartingTaskRequest) (*WaitForStartingTaskResponse, error)
 	KeepTaskAlive(context.Context, *KeepTaskAliveRequest) (*KeepTaskAliveResponse, error)
 	FreeTask(context.Context, *FreeTaskRequest) (*FreeTaskResponse, error)
+	GetRunningTasks(context.Context, *GetRunningTasksRequest) (*GetRunningTasksResponse, error)
 	mustEmbedUnimplementedSchedulerServiceServer()
 }
 
@@ -112,6 +125,9 @@ func (UnimplementedSchedulerServiceServer) KeepTaskAlive(context.Context, *KeepT
 }
 func (UnimplementedSchedulerServiceServer) FreeTask(context.Context, *FreeTaskRequest) (*FreeTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FreeTask not implemented")
+}
+func (UnimplementedSchedulerServiceServer) GetRunningTasks(context.Context, *GetRunningTasksRequest) (*GetRunningTasksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRunningTasks not implemented")
 }
 func (UnimplementedSchedulerServiceServer) mustEmbedUnimplementedSchedulerServiceServer() {}
 func (UnimplementedSchedulerServiceServer) testEmbeddedByValue()                          {}
@@ -206,6 +222,24 @@ func _SchedulerService_FreeTask_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SchedulerService_GetRunningTasks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRunningTasksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServiceServer).GetRunningTasks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SchedulerService_GetRunningTasks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServiceServer).GetRunningTasks(ctx, req.(*GetRunningTasksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SchedulerService_ServiceDesc is the grpc.ServiceDesc for SchedulerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -228,6 +262,10 @@ var SchedulerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "FreeTask",
 			Handler:    _SchedulerService_FreeTask_Handler,
+		},
+		{
+			MethodName: "GetRunningTasks",
+			Handler:    _SchedulerService_GetRunningTasks_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

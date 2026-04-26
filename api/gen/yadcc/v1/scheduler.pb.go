@@ -550,6 +550,167 @@ func (*FreeTaskResponse) Descriptor() ([]byte, []int) {
 	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{8}
 }
 
+type GetRunningTasksRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRunningTasksRequest) Reset() {
+	*x = GetRunningTasksRequest{}
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRunningTasksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRunningTasksRequest) ProtoMessage() {}
+
+func (x *GetRunningTasksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRunningTasksRequest.ProtoReflect.Descriptor instead.
+func (*GetRunningTasksRequest) Descriptor() ([]byte, []int) {
+	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetRunningTasksRequest) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+// RunningTaskInfo describes a single in-flight task grant.
+type RunningTaskInfo struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	TaskGrantId uint64                 `protobuf:"varint,1,opt,name=task_grant_id,json=taskGrantId,proto3" json:"task_grant_id,omitempty"`
+	// worker_location is the servant address ("host:port") executing the task.
+	WorkerLocation string `protobuf:"bytes,2,opt,name=worker_location,json=workerLocation,proto3" json:"worker_location,omitempty"`
+	// age_seconds is how long ago the grant was issued (rounded to the nearest
+	// second).
+	AgeSeconds    uint32 `protobuf:"varint,3,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RunningTaskInfo) Reset() {
+	*x = RunningTaskInfo{}
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RunningTaskInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RunningTaskInfo) ProtoMessage() {}
+
+func (x *RunningTaskInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RunningTaskInfo.ProtoReflect.Descriptor instead.
+func (*RunningTaskInfo) Descriptor() ([]byte, []int) {
+	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RunningTaskInfo) GetTaskGrantId() uint64 {
+	if x != nil {
+		return x.TaskGrantId
+	}
+	return 0
+}
+
+func (x *RunningTaskInfo) GetWorkerLocation() string {
+	if x != nil {
+		return x.WorkerLocation
+	}
+	return ""
+}
+
+func (x *RunningTaskInfo) GetAgeSeconds() uint32 {
+	if x != nil {
+		return x.AgeSeconds
+	}
+	return 0
+}
+
+type GetRunningTasksResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Tasks []*RunningTaskInfo     `protobuf:"bytes,1,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	// total_workers is the number of currently registered workers.
+	TotalWorkers  uint32 `protobuf:"varint,2,opt,name=total_workers,json=totalWorkers,proto3" json:"total_workers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRunningTasksResponse) Reset() {
+	*x = GetRunningTasksResponse{}
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRunningTasksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRunningTasksResponse) ProtoMessage() {}
+
+func (x *GetRunningTasksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_yadcc_v1_scheduler_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRunningTasksResponse.ProtoReflect.Descriptor instead.
+func (*GetRunningTasksResponse) Descriptor() ([]byte, []int) {
+	return file_yadcc_v1_scheduler_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetRunningTasksResponse) GetTasks() []*RunningTaskInfo {
+	if x != nil {
+		return x.Tasks
+	}
+	return nil
+}
+
+func (x *GetRunningTasksResponse) GetTotalWorkers() uint32 {
+	if x != nil {
+		return x.TotalWorkers
+	}
+	return 0
+}
+
 var File_yadcc_v1_scheduler_proto protoreflect.FileDescriptor
 
 const file_yadcc_v1_scheduler_proto_rawDesc = "" +
@@ -588,12 +749,23 @@ const file_yadcc_v1_scheduler_proto_rawDesc = "" +
 	"\x0fFreeTaskRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12$\n" +
 	"\x0etask_grant_ids\x18\x02 \x03(\x04R\ftaskGrantIds\"\x12\n" +
-	"\x10FreeTaskResponse2\xd1\x02\n" +
+	"\x10FreeTaskResponse\".\n" +
+	"\x16GetRunningTasksRequest\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\"\x7f\n" +
+	"\x0fRunningTaskInfo\x12\"\n" +
+	"\rtask_grant_id\x18\x01 \x01(\x04R\vtaskGrantId\x12'\n" +
+	"\x0fworker_location\x18\x02 \x01(\tR\x0eworkerLocation\x12\x1f\n" +
+	"\vage_seconds\x18\x03 \x01(\rR\n" +
+	"ageSeconds\"o\n" +
+	"\x17GetRunningTasksResponse\x12/\n" +
+	"\x05tasks\x18\x01 \x03(\v2\x19.yadcc.v1.RunningTaskInfoR\x05tasks\x12#\n" +
+	"\rtotal_workers\x18\x02 \x01(\rR\ftotalWorkers2\xa9\x03\n" +
 	"\x10SchedulerService\x12D\n" +
 	"\tHeartbeat\x12\x1a.yadcc.v1.HeartbeatRequest\x1a\x1b.yadcc.v1.HeartbeatResponse\x12b\n" +
 	"\x13WaitForStartingTask\x12$.yadcc.v1.WaitForStartingTaskRequest\x1a%.yadcc.v1.WaitForStartingTaskResponse\x12P\n" +
 	"\rKeepTaskAlive\x12\x1e.yadcc.v1.KeepTaskAliveRequest\x1a\x1f.yadcc.v1.KeepTaskAliveResponse\x12A\n" +
-	"\bFreeTask\x12\x19.yadcc.v1.FreeTaskRequest\x1a\x1a.yadcc.v1.FreeTaskResponseB#Z!yadcc-go/api/gen/yadcc/v1;yadccv1b\x06proto3"
+	"\bFreeTask\x12\x19.yadcc.v1.FreeTaskRequest\x1a\x1a.yadcc.v1.FreeTaskResponse\x12V\n" +
+	"\x0fGetRunningTasks\x12 .yadcc.v1.GetRunningTasksRequest\x1a!.yadcc.v1.GetRunningTasksResponseB#Z!yadcc-go/api/gen/yadcc/v1;yadccv1b\x06proto3"
 
 var (
 	file_yadcc_v1_scheduler_proto_rawDescOnce sync.Once
@@ -607,7 +779,7 @@ func file_yadcc_v1_scheduler_proto_rawDescGZIP() []byte {
 	return file_yadcc_v1_scheduler_proto_rawDescData
 }
 
-var file_yadcc_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_yadcc_v1_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_yadcc_v1_scheduler_proto_goTypes = []any{
 	(*HeartbeatRequest)(nil),            // 0: yadcc.v1.HeartbeatRequest
 	(*HeartbeatResponse)(nil),           // 1: yadcc.v1.HeartbeatResponse
@@ -618,25 +790,31 @@ var file_yadcc_v1_scheduler_proto_goTypes = []any{
 	(*KeepTaskAliveResponse)(nil),       // 6: yadcc.v1.KeepTaskAliveResponse
 	(*FreeTaskRequest)(nil),             // 7: yadcc.v1.FreeTaskRequest
 	(*FreeTaskResponse)(nil),            // 8: yadcc.v1.FreeTaskResponse
-	(*EnvironmentDesc)(nil),             // 9: yadcc.v1.EnvironmentDesc
+	(*GetRunningTasksRequest)(nil),      // 9: yadcc.v1.GetRunningTasksRequest
+	(*RunningTaskInfo)(nil),             // 10: yadcc.v1.RunningTaskInfo
+	(*GetRunningTasksResponse)(nil),     // 11: yadcc.v1.GetRunningTasksResponse
+	(*EnvironmentDesc)(nil),             // 12: yadcc.v1.EnvironmentDesc
 }
 var file_yadcc_v1_scheduler_proto_depIdxs = []int32{
-	9, // 0: yadcc.v1.HeartbeatRequest.environments:type_name -> yadcc.v1.EnvironmentDesc
-	9, // 1: yadcc.v1.WaitForStartingTaskRequest.environment:type_name -> yadcc.v1.EnvironmentDesc
-	3, // 2: yadcc.v1.WaitForStartingTaskResponse.grants:type_name -> yadcc.v1.StartingTaskGrant
-	0, // 3: yadcc.v1.SchedulerService.Heartbeat:input_type -> yadcc.v1.HeartbeatRequest
-	2, // 4: yadcc.v1.SchedulerService.WaitForStartingTask:input_type -> yadcc.v1.WaitForStartingTaskRequest
-	5, // 5: yadcc.v1.SchedulerService.KeepTaskAlive:input_type -> yadcc.v1.KeepTaskAliveRequest
-	7, // 6: yadcc.v1.SchedulerService.FreeTask:input_type -> yadcc.v1.FreeTaskRequest
-	1, // 7: yadcc.v1.SchedulerService.Heartbeat:output_type -> yadcc.v1.HeartbeatResponse
-	4, // 8: yadcc.v1.SchedulerService.WaitForStartingTask:output_type -> yadcc.v1.WaitForStartingTaskResponse
-	6, // 9: yadcc.v1.SchedulerService.KeepTaskAlive:output_type -> yadcc.v1.KeepTaskAliveResponse
-	8, // 10: yadcc.v1.SchedulerService.FreeTask:output_type -> yadcc.v1.FreeTaskResponse
-	7, // [7:11] is the sub-list for method output_type
-	3, // [3:7] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	12, // 0: yadcc.v1.HeartbeatRequest.environments:type_name -> yadcc.v1.EnvironmentDesc
+	12, // 1: yadcc.v1.WaitForStartingTaskRequest.environment:type_name -> yadcc.v1.EnvironmentDesc
+	3,  // 2: yadcc.v1.WaitForStartingTaskResponse.grants:type_name -> yadcc.v1.StartingTaskGrant
+	10, // 3: yadcc.v1.GetRunningTasksResponse.tasks:type_name -> yadcc.v1.RunningTaskInfo
+	0,  // 4: yadcc.v1.SchedulerService.Heartbeat:input_type -> yadcc.v1.HeartbeatRequest
+	2,  // 5: yadcc.v1.SchedulerService.WaitForStartingTask:input_type -> yadcc.v1.WaitForStartingTaskRequest
+	5,  // 6: yadcc.v1.SchedulerService.KeepTaskAlive:input_type -> yadcc.v1.KeepTaskAliveRequest
+	7,  // 7: yadcc.v1.SchedulerService.FreeTask:input_type -> yadcc.v1.FreeTaskRequest
+	9,  // 8: yadcc.v1.SchedulerService.GetRunningTasks:input_type -> yadcc.v1.GetRunningTasksRequest
+	1,  // 9: yadcc.v1.SchedulerService.Heartbeat:output_type -> yadcc.v1.HeartbeatResponse
+	4,  // 10: yadcc.v1.SchedulerService.WaitForStartingTask:output_type -> yadcc.v1.WaitForStartingTaskResponse
+	6,  // 11: yadcc.v1.SchedulerService.KeepTaskAlive:output_type -> yadcc.v1.KeepTaskAliveResponse
+	8,  // 12: yadcc.v1.SchedulerService.FreeTask:output_type -> yadcc.v1.FreeTaskResponse
+	11, // 13: yadcc.v1.SchedulerService.GetRunningTasks:output_type -> yadcc.v1.GetRunningTasksResponse
+	9,  // [9:14] is the sub-list for method output_type
+	4,  // [4:9] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_yadcc_v1_scheduler_proto_init() }
@@ -651,7 +829,7 @@ func file_yadcc_v1_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_yadcc_v1_scheduler_proto_rawDesc), len(file_yadcc_v1_scheduler_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

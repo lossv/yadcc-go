@@ -11,6 +11,7 @@ service SchedulerService {
   rpc WaitForStartingTask(WaitForStartingTaskRequest) returns (WaitForStartingTaskResponse);
   rpc KeepTaskAlive(KeepTaskAliveRequest) returns (KeepTaskAliveResponse);
   rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
+  rpc GetRunningTasks(GetRunningTasksRequest) returns (GetRunningTasksResponse);
 }
 
 message HeartbeatRequest {
@@ -68,3 +69,23 @@ message FreeTaskRequest {
 }
 
 message FreeTaskResponse {}
+
+message GetRunningTasksRequest {
+  string token = 1;
+}
+
+// RunningTaskInfo describes a single in-flight task grant.
+message RunningTaskInfo {
+  uint64 task_grant_id = 1;
+  // worker_location is the servant address ("host:port") executing the task.
+  string worker_location = 2;
+  // age_seconds is how long ago the grant was issued (rounded to the nearest
+  // second).
+  uint32 age_seconds = 3;
+}
+
+message GetRunningTasksResponse {
+  repeated RunningTaskInfo tasks = 1;
+  // total_workers is the number of currently registered workers.
+  uint32 total_workers = 2;
+}

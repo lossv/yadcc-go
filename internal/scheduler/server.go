@@ -344,6 +344,34 @@ func (s *Server) evictLoop() {
 	}
 }
 
+// GetRunningTasks returns information about all currently in-flight task
+// grants.  Any authenticated token is accepted (same as other RPCs).
+func (s *Server) GetRunningTasks(_ context.Context, req *pb.GetRunningTasksRequest) (*pb.GetRunningTasksResponse, error) {
+	s.ensureInit()
+	if req.Token == "" {
+		return nil, status.Error(codes.Unauthenticated, "token required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tasks := make([]*pb.RunningTaskInfo, 0, len(s.grants))
+	for gid, g := range s.grants {
+		loc := g.workerID
+		if w, ok := s.workers[g.workerID]; ok {
+			loc = w.location
+		}
+		tasks = append(tasks, &pb.RunningTaskInfo{
+			TaskGrantId:    gid,
+			WorkerLocation: loc,
+			AgeSeconds:     uint32(time.Since(g.issuedAt).Seconds()),
+		})
+	}
+	return &pb.GetRunningTasksResponse{
+		Tasks:        tasks,
+		TotalWorkers: uint32(len(s.workers)),
+	}, nil
+}
+
 // ---------- HTTP debug endpoint ----------
 
 func (s *Server) serveHTTP() {
@@ -355,16 +383,34 @@ func (s *Server) serveHTTP() {
 		s.mu.Lock()
 		workers := len(s.workers)
 		grants := len(s.grants)
+		tasks := make([]map[string]any, 0, len(s.grants))
+		for gid, g := range s.grants {
+			tasks = append(tasks, map[string]any{
+				"task_grant_id":   gid,
+				"worker_location": s.workerLocationLocked(g.workerID),
+				"age_seconds":     uint32(time.Since(g.issuedAt).Seconds()),
+			})
+		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"version":       buildinfo.String(),
 			"workers":       workers,
 			"running_tasks": grants,
+			"tasks":         tasks,
 		})
 	})
 	mux.Handle("/metrics", metrics.Handler())
 	slog.Info("scheduler: HTTP debug server listening", "addr", s.HTTPAddr)
 	_ = http.ListenAndServe(s.HTTPAddr, mux)
+}
+
+// workerLocationLocked returns the servant location for a worker id.
+// Must be called with s.mu held.
+func (s *Server) workerLocationLocked(workerID string) string {
+	if w, ok := s.workers[workerID]; ok {
+		return w.location
+	}
+	return workerID
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
