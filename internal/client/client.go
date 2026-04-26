@@ -44,6 +44,15 @@ func Run(argv []string) int {
 	parsedArgs := compiler.Parse(compilerArgs)
 	if !parsedArgs.IsDistributable() {
 		// Not a distributable compile task — run locally.
+		if WarnOnNonDistributable() {
+			slog.Warn("yadcc: task is not distributable, compiling locally", "compiler", compilerPath)
+		}
+		return platform.Passthrough(compilerPath, compilerArgs)
+	}
+
+	// YADCC_DEBUGGING_COMPILE_LOCALLY: bypass distributed path entirely.
+	if DebuggingCompileLocally() {
+		slog.Debug("yadcc: YADCC_DEBUGGING_COMPILE_LOCALLY set, running locally")
 		return platform.Passthrough(compilerPath, compilerArgs)
 	}
 
@@ -76,6 +85,25 @@ func tryDistributed(compilerPath string, compilerArgs []string, parsedArgs compi
 	ppResult, err := compiler.Preprocess(compilerPath, parsedArgs)
 	if err != nil {
 		return 0, fmt.Errorf("preprocessing: %w", err)
+	}
+
+	// YADCC_COMPILE_ON_CLOUD_SIZE_THRESHOLD: if preprocessed source is below
+	// the threshold, it's not worth the round-trip overhead — compile locally.
+	threshold := CompileOnCloudSizeThreshold()
+	if threshold > 0 && len(ppResult.Source) < threshold {
+		slog.Debug("yadcc: preprocessed source below cloud threshold, compiling locally",
+			"size", len(ppResult.Source), "threshold", threshold)
+		return 0, fmt.Errorf("source too small for cloud (%d < %d)", len(ppResult.Source), threshold)
+	}
+
+	// YADCC_WARN_ON_NONCACHEABLE: detect timestamp macros.
+	if WarnOnNoncacheable() {
+		for _, needle := range [][]byte{[]byte("__TIME__"), []byte("__DATE__"), []byte("__TIMESTAMP__")} {
+			if bytes.Contains(ppResult.Source, needle) {
+				slog.Warn("yadcc: preprocessed source contains timestamp macro, result will not be cached")
+				break
+			}
+		}
 	}
 
 	// Step 2: submit to daemon.

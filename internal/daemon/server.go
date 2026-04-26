@@ -102,6 +102,7 @@ type Server struct {
 	tg              taskgroup.Group[compileResult]
 	sem             chan struct{} // limits concurrent local fallback compiles
 	ppSem           chan struct{} // limits concurrent preprocessing (P1-7)
+	localMonitor    *localTaskMonitor
 	schedulerConn   *grpc.ClientConn
 	schedulerClient pb.SchedulerServiceClient
 	cacheConn       *grpc.ClientConn
@@ -182,6 +183,10 @@ func (s *Server) init() {
 		// Semaphore for preprocessing (P1-7): at most NumCPU concurrent.
 		s.ppSem = make(chan struct{}, runtime.NumCPU())
 
+		// Local task monitor: PID-tracked permits for wrapper processes.
+		// maxTasks = nproc/2; overProvisioning = 0 (no lightweight bonus by default).
+		s.localMonitor = newLocalTaskMonitor(s.maxLocalParallel(), 0)
+
 		// Configure token auth.
 		s.verifier.SetUserTokens(s.UserTokens)
 		s.verifier.SetServantTokens(s.ServantTokens)
@@ -256,6 +261,9 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/local/get_version", s.handleVersion)
 	mux.HandleFunc("/local/submit_task", s.handleSubmitTask)
+	mux.HandleFunc("/local/acquire_quota", s.handleAcquireQuota)
+	mux.HandleFunc("/local/release_quota", s.handleReleaseQuota)
+	mux.HandleFunc("/local/ask_to_leave", s.handleAskToLeave)
 	mux.Handle("/metrics", metrics.Handler())
 	slog.Info("daemon: local HTTP listening", "addr", s.localAddr(),
 		"servant", s.servantAddr(), "scheduler", s.SchedulerAddr,
@@ -286,6 +294,77 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"version": buildinfo.String()})
+}
+
+// handleAcquireQuota implements POST /local/acquire_quota.
+//
+// JSON body: {"milliseconds_to_wait": N, "lightweight_task": bool, "requestor_pid": N}
+// Response 200 = granted; 503 = timed out.
+//
+// This is the Go equivalent of HttpServiceImpl::AcquireQuota in
+// yadcc/daemon/local/http_service_impl.cc.
+func (s *Server) handleAcquireQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		MillisecondsToWait uint32 `json:"milliseconds_to_wait"`
+		LightweightTask    bool   `json:"lightweight_task"`
+		RequestorPID       int    `json:"requestor_pid"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err := json.Unmarshal(body, &req); err != nil || req.RequestorPID == 0 {
+		http.Error(w, "invalid arguments", http.StatusBadRequest)
+		return
+	}
+
+	const maxWait = 10 * time.Second
+	want := time.Duration(req.MillisecondsToWait) * time.Millisecond
+	if want > maxWait {
+		want = maxWait
+	}
+	if want <= 0 {
+		want = maxWait
+	}
+
+	if !s.localMonitor.WaitForPermit(req.RequestorPID, req.LightweightTask, want) {
+		http.Error(w, "quota unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "granted"})
+}
+
+// handleReleaseQuota implements POST /local/release_quota.
+//
+// JSON body: {"requestor_pid": N}
+func (s *Server) handleReleaseQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		RequestorPID int `json:"requestor_pid"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err := json.Unmarshal(body, &req); err != nil || req.RequestorPID == 0 {
+		http.Error(w, "invalid arguments", http.StatusBadRequest)
+		return
+	}
+	s.localMonitor.ReleasePermit(req.RequestorPID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// handleAskToLeave implements POST /local/ask_to_leave.
+// The C++ daemon calls kill(getpid(), SIGINT) in response.  We do the same.
+func (s *Server) handleAskToLeave(w http.ResponseWriter, r *http.Request) {
+	slog.Info("daemon: asked to leave, shutting down")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "leaving"})
+	// Give the response a moment to flush before we exit.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(0)
+	}()
 }
 
 func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
@@ -738,7 +817,7 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 		return errResp("decompress: " + err.Error())
 	}
 
-	lang := inferLang(req.CompilerArguments)
+	lang, _ := compiler.Parse(req.CompilerArguments).Language()
 	ext := ".i"
 	if lang == "c++" || lang == "c++-cpp-output" {
 		ext = ".ii"
@@ -1081,6 +1160,14 @@ func (s *Server) token() string {
 }
 
 func (s *Server) maxLocalParallel() int {
+	// Prefer cgroup CPU quota when available (mirrors C++ local_task_monitor.cc).
+	if cgroupCPUs := sysinfo.CgroupCPUQuota(); cgroupCPUs > 0 {
+		n := cgroupCPUs / 2
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
 	// Default: half the logical CPUs.
 	n := runtime.NumCPU() / 2
 	if n < 1 {
