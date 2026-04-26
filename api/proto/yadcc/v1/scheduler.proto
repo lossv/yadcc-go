@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package yadcc.v1;
+
+option go_package = "yadcc-go/api/gen/yadcc/v1;yadccv1";
+
+import "yadcc/v1/common.proto";
+
+service SchedulerService {
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc WaitForStartingTask(WaitForStartingTaskRequest) returns (WaitForStartingTaskResponse);
+  rpc KeepTaskAlive(KeepTaskAliveRequest) returns (KeepTaskAliveResponse);
+  rpc FreeTask(FreeTaskRequest) returns (FreeTaskResponse);
+}
+
+message HeartbeatRequest {
+  string token = 1;
+  string location = 2;
+  uint32 version = 3;
+  uint32 capacity = 4;
+  uint32 current_load = 5;
+  uint64 total_memory_bytes = 6;
+  uint64 available_memory_bytes = 7;
+  repeated EnvironmentDesc environments = 8;
+}
+
+message HeartbeatResponse {
+  repeated string acceptable_daemon_tokens = 1;
+  repeated uint64 expired_task_grant_ids = 2;
+}
+
+message WaitForStartingTaskRequest {
+  string token = 1;
+  EnvironmentDesc environment = 2;
+  uint32 immediate_requests = 3;
+  uint32 prefetch_requests = 4;
+  uint32 milliseconds_to_wait = 5;
+}
+
+message StartingTaskGrant {
+  uint64 task_grant_id = 1;
+  string servant_location = 2;
+}
+
+message WaitForStartingTaskResponse {
+  repeated StartingTaskGrant grants = 1;
+}
+
+message KeepTaskAliveRequest {
+  string token = 1;
+  repeated uint64 task_grant_ids = 2;
+}
+
+message KeepTaskAliveResponse {
+  repeated bool statuses = 1;
+}
+
+message FreeTaskRequest {
+  string token = 1;
+  repeated uint64 task_grant_ids = 2;
+}
+
+message FreeTaskResponse {}

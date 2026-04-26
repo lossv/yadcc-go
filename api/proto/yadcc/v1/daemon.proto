@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package yadcc.v1;
+
+option go_package = "yadcc-go/api/gen/yadcc/v1;yadccv1";
+
+import "yadcc/v1/common.proto";
+
+service RemoteDaemonService {
+  rpc QueueCxxCompilationTask(QueueCxxCompilationTaskRequest) returns (QueueCxxCompilationTaskResponse);
+  rpc ReferenceTask(ReferenceTaskRequest) returns (ReferenceTaskResponse);
+  rpc WaitForCompilationOutput(WaitForCompilationOutputRequest) returns (WaitForCompilationOutputResponse);
+  rpc FreeRemoteTask(FreeRemoteTaskRequest) returns (FreeRemoteTaskResponse);
+}
+
+message QueueCxxCompilationTaskRequest {
+  string token = 1;
+  uint64 task_grant_id = 2;
+  EnvironmentDesc environment = 3;
+  string source_path = 4;
+  repeated string compiler_arguments = 5;
+  bytes zstd_preprocessed_source = 6;
+  bool disallow_cache_fill = 7;
+}
+
+message QueueCxxCompilationTaskResponse {
+  uint64 task_id = 1;
+}
+
+message ReferenceTaskRequest {
+  string token = 1;
+  uint64 task_id = 2;
+}
+
+message ReferenceTaskResponse {}
+
+message WaitForCompilationOutputRequest {
+  string token = 1;
+  uint64 task_id = 2;
+  uint32 milliseconds_to_wait = 3;
+}
+
+message WaitForCompilationOutputResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_RUNNING = 1;
+    STATUS_DONE = 2;
+    STATUS_NOT_FOUND = 3;
+  }
+
+  Status status = 1;
+  int32 exit_code = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+  repeated FileBlob outputs = 5;
+}
+
+message FreeRemoteTaskRequest {
+  string token = 1;
+  uint64 task_id = 2;
+}
+
+message FreeRemoteTaskResponse {}

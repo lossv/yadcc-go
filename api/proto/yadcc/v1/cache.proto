@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package yadcc.v1;
+
+option go_package = "yadcc-go/api/gen/yadcc/v1;yadccv1";
+
+service CacheService {
+  rpc FetchBloomFilter(FetchBloomFilterRequest) returns (FetchBloomFilterResponse);
+  rpc TryGetEntry(TryGetEntryRequest) returns (TryGetEntryResponse);
+  rpc PutEntry(PutEntryRequest) returns (PutEntryResponse);
+}
+
+message FetchBloomFilterRequest {
+  string token = 1;
+  uint32 seconds_since_last_full_fetch = 2;
+  uint32 seconds_since_last_fetch = 3;
+}
+
+message FetchBloomFilterResponse {
+  bool incremental = 1;
+  repeated string newly_populated_keys = 2;
+  bytes bloom_filter = 3;
+  uint32 num_hashes = 4;
+}
+
+message TryGetEntryRequest {
+  string token = 1;
+  string key = 2;
+}
+
+message TryGetEntryResponse {
+  bytes value = 1;
+}
+
+message PutEntryRequest {
+  string token = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message PutEntryResponse {}

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package yadcc.v1;
+
+option go_package = "yadcc-go/api/gen/yadcc/v1;yadccv1";
+
+message EnvironmentDesc {
+  string compiler_digest = 1;
+  string compiler_kind = 2;
+  string compiler_version = 3;
+  string host_os = 4;
+  string host_arch = 5;
+  string target_triple = 6;
+  string object_format = 7;
+  string sysroot_digest = 8;
+  string stdlib_digest = 9;
+  string abi = 10;
+  uint32 cache_format_version = 11;
+}
+
+message FileBlob {
+  string name = 1;
+  bytes data = 2;
+}
