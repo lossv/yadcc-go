@@ -62,6 +62,14 @@ func (a Args) Files() []string {
 	return append([]string(nil), a.files...)
 }
 
+// SourceFile returns the single source file argument, or "" if not exactly one.
+func (a Args) SourceFile() string {
+	if len(a.files) == 1 {
+		return a.files[0]
+	}
+	return ""
+}
+
 func (a Args) Has(key string) bool {
 	_, ok := a.Get(key)
 	return ok
@@ -116,6 +124,38 @@ func (a Args) Language() (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// TargetTriple returns the value of -target if present.
+func (a Args) TargetTriple() string {
+	if values, ok := a.Get("-target"); ok && len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// Sysroot returns the sysroot path from -isysroot or --sysroot.
+func (a Args) Sysroot() string {
+	if values, ok := a.Get("-isysroot"); ok && len(values) > 0 {
+		return values[0]
+	}
+	if values, ok := a.Get("--sysroot"); ok && len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// Stdlib returns the -stdlib value (e.g. "libc++", "libstdc++").
+func (a Args) Stdlib() string {
+	for _, opt := range a.options {
+		if strings.HasPrefix(opt.Key, "-stdlib=") {
+			return strings.TrimPrefix(opt.Key, "-stdlib=")
+		}
+		if opt.Key == "-stdlib" && len(opt.Values) > 0 {
+			return opt.Values[0]
+		}
+	}
+	return ""
 }
 
 func (a Args) IsDistributable() bool {

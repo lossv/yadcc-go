@@ -40,6 +40,9 @@ import (
 	"yadcc-go/internal/cache"
 	"yadcc-go/internal/compiler"
 	"yadcc-go/internal/compress"
+	"yadcc-go/internal/metrics"
+	"yadcc-go/internal/objpatch"
+	"yadcc-go/internal/sysinfo"
 	"yadcc-go/internal/taskgroup"
 
 	"google.golang.org/grpc"
@@ -90,16 +93,26 @@ type Server struct {
 	store           cache.Store
 	tg              taskgroup.Group[compileResult]
 	sem             chan struct{} // limits concurrent local fallback compiles
+	ppSem           chan struct{} // limits concurrent preprocessing (P1-7)
 	schedulerConn   *grpc.ClientConn
 	schedulerClient pb.SchedulerServiceClient
 	cacheConn       *grpc.ClientConn
 	cacheClient     pb.CacheServiceClient
+	// bloomMu guards bloomFilter below.
+	bloomMu        sync.RWMutex
+	bloomFilter    *cache.BloomFilter // may be nil if no external cache
+	bloomLastFetch time.Time
+
+	// grantPool is a small pre-fetched pool of task grants from the scheduler.
+	// When tryRemote needs a grant, it first checks this pool to reduce latency.
+	grantPool chan *pb.StartingTaskGrant
 
 	// --- servant (gRPC) side ---
 	pb.UnimplementedRemoteDaemonServiceServer
 	nextTaskID atomic.Uint64
 	tasksMu    sync.Mutex
 	tasks      map[uint64]*taskRecord
+	servantSem chan struct{} // limits concurrent remote compile tasks
 }
 
 type compileResult struct {
@@ -123,6 +136,10 @@ type SubmitRequest struct {
 	Language           string   `json:"language"`
 	PreprocessedSource []byte   `json:"preprocessed_source"`
 	OutputFile         string   `json:"output_file"`
+	// SourcePath is the original source file path (before preprocessing).
+	// It is used for path-rewriting in remote object files so debug info
+	// points to the correct local path rather than the remote temp file.
+	SourcePath string `json:"source_path,omitempty"`
 }
 
 // SubmitResponse is the JSON response to the wrapper.
@@ -153,17 +170,31 @@ func (s *Server) init() {
 
 		// Semaphore for local fallback compilations.
 		s.sem = make(chan struct{}, s.maxLocalParallel())
+		// Semaphore for preprocessing (P1-7): at most NumCPU concurrent.
+		s.ppSem = make(chan struct{}, runtime.NumCPU())
 
 		// In-process L1 cache.
 		s.store = cache.NewMemoryStore()
 
+		// Grant prefetch pool: capacity = min(4, maxLocalParallel).
+		poolSize := s.maxLocalParallel()
+		if poolSize > 4 {
+			poolSize = 4
+		}
+		s.grantPool = make(chan *pb.StartingTaskGrant, poolSize)
+
 		// Task map for servant side.
-		s.tasks = make(map[uint64]*taskRecord)
+		s.tasks = make(map[uint64]*taskRecord) // Servant semaphore: limits concurrent remote compile tasks.
+		cap := s.capacity()
+		if cap < 1 {
+			cap = 1
+		}
+		s.servantSem = make(chan struct{}, cap)
 
 		// Scheduler gRPC connection.
 		if s.SchedulerAddr != "" {
-		conn, err := grpc.NewClient(s.SchedulerAddr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.NewClient(s.SchedulerAddr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				slog.Warn("daemon: failed to connect to scheduler", "error", err)
 			} else {
@@ -174,9 +205,9 @@ func (s *Server) init() {
 
 		// External cache gRPC connection.
 		if s.CacheAddr != "" {
-		conn, err := grpc.NewClient(s.CacheAddr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(
+			conn, err := grpc.NewClient(s.CacheAddr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithDefaultCallOptions(
 					grpc.MaxCallRecvMsgSize(256<<20),
 					grpc.MaxCallSendMsgSize(256<<20),
 				))
@@ -186,6 +217,8 @@ func (s *Server) init() {
 				s.cacheConn = conn
 				s.cacheClient = pb.NewCacheServiceClient(conn)
 				slog.Info("daemon: connected to external cache", "addr", s.CacheAddr)
+				// Start background bloom filter refresh.
+				go s.bloomRefreshLoop()
 			}
 		}
 	})
@@ -209,6 +242,7 @@ func (s *Server) ListenAndServe() error {
 			slog.Warn("daemon: initial heartbeat failed", "error", err)
 		}
 		go s.heartbeatLoop()
+		go s.grantPrefetchLoop()
 	}
 
 	// Serve the local HTTP API (wrapper-facing).
@@ -216,6 +250,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/local/get_version", s.handleVersion)
 	mux.HandleFunc("/local/submit_task", s.handleSubmitTask)
+	mux.Handle("/metrics", metrics.Handler())
 	slog.Info("daemon: local HTTP listening", "addr", s.localAddr(),
 		"servant", s.servantAddr(), "scheduler", s.SchedulerAddr,
 		"worker_id", s.WorkerID, "version", buildinfo.String())
@@ -264,6 +299,29 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := buildCacheKey(req)
+
+	// P1-7: limit concurrent in-flight compile tasks on the local daemon to
+	// avoid overloading the host when many wrapper processes submit at once.
+	// We use ppSem (sized to NumCPU) as the overall pipeline gate.
+	select {
+	case s.ppSem <- struct{}{}:
+		defer func() { <-s.ppSem }()
+	default:
+		// Overloaded: fall back to local execution without the task-group
+		// deduplication, so the client can proceed immediately.
+		res, err := s.localCompile(req)
+		if err != nil {
+			slog.Warn("daemon: local compile failed", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, SubmitResponse{
+			ExitCode: res.ExitCode, Stdout: res.Stdout,
+			Stderr: res.Stderr, ObjectFile: res.ObjectFile,
+		})
+		return
+	}
+
 	result := s.tg.Do(cacheKey, func() (compileResult, error) {
 		return s.execute(req, cacheKey)
 	})
@@ -292,14 +350,20 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 
 	// L1: in-process memory cache (only for cacheable tasks).
 	if cacheable {
-		if obj, err := s.store.Get(cacheKey); err == nil {
-			slog.Debug("daemon: L1 cache hit", "key", cacheKey[:8])
-			return compileResult{ExitCode: 0, ObjectFile: obj, CacheHit: true}, nil
+		if data, err := s.store.Get(cacheKey); err == nil {
+			if entry, err := cache.UnmarshalEntry(data); err == nil {
+				slog.Debug("daemon: L1 cache hit", "key", cacheKey[:8])
+				metrics.DaemonTasksTotal.WithLabelValues("cache_hit_l1").Inc()
+				return compileResult{
+					ExitCode: int(entry.ExitCode), Stdout: entry.Stdout,
+					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile, CacheHit: true,
+				}, nil
+			}
 		}
 	}
 
 	// L2: external gRPC cache (only for cacheable tasks).
-	if cacheable && s.cacheClient != nil {
+	if cacheable && s.cacheClient != nil && s.bloomMayContain(cacheKey) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		resp, err := s.cacheClient.TryGetEntry(ctx, &pb.TryGetEntryRequest{
 			Token: s.token(),
@@ -307,9 +371,15 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 		})
 		cancel()
 		if err == nil && len(resp.Value) > 0 {
-			slog.Debug("daemon: L2 cache hit", "key", cacheKey[:8])
-			_ = s.store.Put(cacheKey, resp.Value)
-			return compileResult{ExitCode: 0, ObjectFile: resp.Value, CacheHit: true}, nil
+			if entry, err := cache.UnmarshalEntry(resp.Value); err == nil {
+				slog.Debug("daemon: L2 cache hit", "key", cacheKey[:8])
+				metrics.DaemonTasksTotal.WithLabelValues("cache_hit_l2").Inc()
+				_ = s.store.Put(cacheKey, resp.Value)
+				return compileResult{
+					ExitCode: int(entry.ExitCode), Stdout: entry.Stdout,
+					Stderr: entry.Stderr, ObjectFile: entry.ObjectFile, CacheHit: true,
+				}, nil
+			}
 		}
 	}
 
@@ -317,21 +387,35 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 	var result compileResult
 	var err error
 	if s.schedulerClient != nil {
+		t := time.Now()
 		result, err = s.tryRemote(req)
 		if err != nil {
 			slog.Warn("daemon: remote compile failed, falling back to local", "error", err)
+		} else {
+			metrics.DaemonRemoteLatencySeconds.Observe(time.Since(t).Seconds())
+			metrics.DaemonTasksTotal.WithLabelValues("remote").Inc()
 		}
 	}
 	if err != nil || s.schedulerClient == nil {
+		t := time.Now()
 		result, err = s.localCompile(req)
 		if err != nil {
+			metrics.DaemonTasksTotal.WithLabelValues("error").Inc()
 			return compileResult{}, err
 		}
+		metrics.DaemonLocalLatencySeconds.Observe(time.Since(t).Seconds())
+		metrics.DaemonTasksTotal.WithLabelValues("local").Inc()
 	}
 
 	// Write back to caches (only when the result is deterministic).
 	if cacheable && result.ExitCode == 0 && len(result.ObjectFile) > 0 {
-		_ = s.store.Put(cacheKey, result.ObjectFile)
+		entryBytes := cache.MarshalEntry(cache.Entry{
+			ExitCode:   int32(result.ExitCode),
+			Stdout:     result.Stdout,
+			Stderr:     result.Stderr,
+			ObjectFile: result.ObjectFile,
+		})
+		_ = s.store.Put(cacheKey, entryBytes)
 		if s.cacheClient != nil {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -339,7 +423,7 @@ func (s *Server) execute(req SubmitRequest, cacheKey string) (compileResult, err
 				_, _ = s.cacheClient.PutEntry(ctx, &pb.PutEntryRequest{
 					Token: s.token(),
 					Key:   cacheKey,
-					Value: result.ObjectFile,
+					Value: entryBytes,
 				})
 			}()
 		}
@@ -358,21 +442,31 @@ func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
 
 	compilerDigest, _ := compiler.Digest(req.CompilerPath)
 
-	grantResp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
-		Token:              s.token(),
-		ImmediateRequests:  1,
-		MillisecondsToWait: waitForWorkerMs,
-		Environment: &pb.EnvironmentDesc{
-			CompilerDigest: compilerDigest,
-		},
-	})
-	if err != nil {
-		return compileResult{}, fmt.Errorf("acquire worker: %w", err)
+	// P1-8: try a pre-fetched grant from the pool first.
+	var grant *pb.StartingTaskGrant
+	select {
+	case grant = <-s.grantPool:
+		// Got a pooled grant — validate it's still for a live environment.
+		// (We can't check environment match here, so just use it optimistically.)
+	default:
+		// No pre-fetched grant; request one from the scheduler.
+		grantResp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
+			Token:              s.token(),
+			ImmediateRequests:  1,
+			MillisecondsToWait: waitForWorkerMs,
+			RequesterLocation:  s.servantAddr(),
+			Environment: &pb.EnvironmentDesc{
+				CompilerDigest: compilerDigest,
+			},
+		})
+		if err != nil {
+			return compileResult{}, fmt.Errorf("acquire worker: %w", err)
+		}
+		if len(grantResp.Grants) == 0 {
+			return compileResult{}, fmt.Errorf("no worker grants returned")
+		}
+		grant = grantResp.Grants[0]
 	}
-	if len(grantResp.Grants) == 0 {
-		return compileResult{}, fmt.Errorf("no worker grants returned")
-	}
-	grant := grantResp.Grants[0]
 
 	workerConn, err := grpc.NewClient(grant.ServantLocation,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -397,6 +491,7 @@ func (s *Server) tryRemote(req SubmitRequest) (compileResult, error) {
 		Environment: &pb.EnvironmentDesc{
 			CompilerDigest: compilerDigest,
 		},
+		SourcePath:             req.SourcePath,
 		CompilerArguments:      req.Args,
 		ZstdPreprocessedSource: compress.Compress(req.PreprocessedSource),
 	})
@@ -539,6 +634,13 @@ func (s *Server) localCompile(req SubmitRequest) (compileResult, error) {
 // ---------- servant gRPC (RemoteDaemonServiceServer) ----------
 
 func (s *Server) QueueCxxCompilationTask(_ context.Context, req *pb.QueueCxxCompilationTaskRequest) (*pb.QueueCxxCompilationTaskResponse, error) {
+	// Enforce capacity limit — reject immediately if all slots are taken.
+	select {
+	case s.servantSem <- struct{}{}:
+	default:
+		return nil, status.Error(codes.ResourceExhausted, "servant at capacity")
+	}
+
 	id := s.nextTaskID.Add(1)
 	rec := &taskRecord{done: make(chan struct{})}
 
@@ -547,6 +649,7 @@ func (s *Server) QueueCxxCompilationTask(_ context.Context, req *pb.QueueCxxComp
 	s.tasksMu.Unlock()
 
 	go func() {
+		defer func() { <-s.servantSem }()
 		rec.mu.Lock()
 		rec.result = s.runCompile(req)
 		close(rec.done)
@@ -663,6 +766,11 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 	}
 	if exitCode == 0 {
 		if obj, err := os.ReadFile(tmpOutPath); err == nil {
+			// Patch the remote temp source path back to the expected local path
+			// so debug info / __FILE__ expansions point to the right location.
+			if req.SourcePath != "" {
+				obj = objpatch.Patch(obj, tmpSrcPath, req.SourcePath)
+			}
 			resp.Outputs = []*pb.FileBlob{{Name: "output.o", Data: obj}}
 		}
 	}
@@ -723,6 +831,107 @@ func (s *Server) findCompilerByDigest(digest string) string {
 	return ""
 }
 
+// bloomRefreshLoop periodically fetches the bloom filter from the external
+// cache server so we can skip TryGetEntry when the key is definitely absent.
+func (s *Server) bloomRefreshLoop() {
+	// Initial fetch immediately, then every 60 seconds.
+	s.fetchBloom()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.fetchBloom()
+	}
+}
+
+func (s *Server) fetchBloom() {
+	s.bloomMu.RLock()
+	lastFetch := s.bloomLastFetch
+	s.bloomMu.RUnlock()
+
+	var secondsSince uint32
+	if !lastFetch.IsZero() {
+		d := time.Since(lastFetch)
+		if d > 0 {
+			secondsSince = uint32(d.Seconds())
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := s.cacheClient.FetchBloomFilter(ctx, &pb.FetchBloomFilterRequest{
+		Token:                 s.token(),
+		SecondsSinceLastFetch: secondsSince,
+	})
+	if err != nil {
+		slog.Debug("daemon: bloom filter fetch failed", "error", err)
+		return
+	}
+
+	rawBytes, err := compress.Decompress(resp.BloomFilter)
+	if err != nil || len(rawBytes) == 0 {
+		slog.Debug("daemon: bloom filter decompress failed", "error", err)
+		return
+	}
+
+	s.bloomMu.Lock()
+	defer s.bloomMu.Unlock()
+	if resp.Incremental && s.bloomFilter != nil {
+		// Incremental update: add newly populated keys to the existing filter.
+		for _, k := range resp.NewlyPopulatedKeys {
+			s.bloomFilter.Add(k)
+		}
+	} else {
+		// Full refresh.
+		s.bloomFilter = cache.BloomFilterFromBytes(rawBytes, resp.NumHashes)
+	}
+	s.bloomLastFetch = time.Now()
+}
+
+// bloomMayContain returns true if key is possibly in the external cache, or
+// true if we have no bloom filter yet (fail-open so we don't skip real hits).
+func (s *Server) bloomMayContain(key string) bool {
+	s.bloomMu.RLock()
+	defer s.bloomMu.RUnlock()
+	if s.bloomFilter == nil {
+		return true
+	}
+	return s.bloomFilter.MayContain(key)
+}
+
+// grantPrefetchLoop keeps the grantPool topped up by requesting additional
+// grants from the scheduler whenever the pool has free slots.
+func (s *Server) grantPrefetchLoop() {
+	for {
+		// Block until the pool has space.
+		slack := cap(s.grantPool) - len(s.grantPool)
+		if slack <= 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		// Request up to slack prefetch grants (non-blocking on the scheduler).
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		resp, err := s.schedulerClient.WaitForStartingTask(ctx, &pb.WaitForStartingTaskRequest{
+			Token:              s.token(),
+			ImmediateRequests:  0,
+			PrefetchRequests:   uint32(slack),
+			MillisecondsToWait: 0,
+			RequesterLocation:  s.servantAddr(),
+		})
+		cancel()
+		if err == nil {
+			for _, g := range resp.Grants {
+				select {
+				case s.grantPool <- g:
+				default:
+					// Pool full — free the extra grant.
+					s.freeGrant(g.TaskGrantId)
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // ---------- scheduler heartbeat ----------
 
 func (s *Server) heartbeatLoop() {
@@ -744,13 +953,17 @@ func (s *Server) sendHeartbeat() error {
 	s.tasksMu.Unlock()
 
 	envs := s.Registry.Environments()
+	si := sysinfo.Get()
 
 	_, err := s.schedulerClient.Heartbeat(ctx, &pb.HeartbeatRequest{
-		Token:        s.token(),
-		Location:     s.servantAddr(),
-		Capacity:     s.capacity(),
-		CurrentLoad:  load,
-		Environments: envs,
+		Token:                s.token(),
+		Location:             s.servantAddr(),
+		Capacity:             s.capacity(),
+		CurrentLoad:          load,
+		Environments:         envs,
+		IsDedicated:          s.ServantPriority == ServantPriorityDedicated,
+		TotalMemoryBytes:     si.TotalMemoryBytes,
+		AvailableMemoryBytes: si.AvailableMemoryBytes,
 	})
 	return err
 }
@@ -871,19 +1084,40 @@ func isCacheable(args []string, preprocessed []byte) bool {
 }
 
 // buildCacheKey produces a stable cache key from the compile request.
+// It populates the full cache.KeyInput so that cross-environment collisions are
+// impossible (different target triple, sysroot, stdlib, or ABI → different key).
 func buildCacheKey(req SubmitRequest) string {
 	compilerDigest, err := compiler.Digest(req.CompilerPath)
 	if err != nil {
 		compilerDigest = req.CompilerPath
 	}
-	h := sha256.New()
-	fmt.Fprintf(h, "compiler:%s\n", compilerDigest)
-	fmt.Fprintf(h, "lang:%s\n", req.Language)
-	for _, a := range normalizeArgs(req.Args) {
-		fmt.Fprintf(h, "arg:%s\n", a)
+
+	parsed := compiler.Parse(req.Args)
+
+	// Determine ABI suffix from -m32 / -m64.
+	abi := ""
+	if parsed.Has("-m32") {
+		abi = "ilp32"
+	} else if parsed.Has("-m64") {
+		abi = "lp64"
 	}
-	fmt.Fprintf(h, "source:%x\n", sha256.Sum256(req.PreprocessedSource))
-	return hex.EncodeToString(h.Sum(nil))
+
+	sysrootDigest := compiler.SysrootDigest(parsed.Sysroot())
+	stdlibDigest := compiler.StdlibDigest(req.CompilerPath, parsed.Stdlib())
+
+	sourceDigest := sha256.Sum256(req.PreprocessedSource)
+
+	input := cache.KeyInput{
+		CompilerDigest:           compilerDigest,
+		CompilerKind:             req.Language,
+		TargetTriple:             parsed.TargetTriple(),
+		ABI:                      abi,
+		SysrootDigest:            sysrootDigest,
+		StdlibDigest:             stdlibDigest,
+		NormalizedArguments:      normalizeArgs(req.Args),
+		PreprocessedSourceDigest: hex.EncodeToString(sourceDigest[:]),
+	}
+	return cache.BuildKey(input)
 }
 
 func normalizeArgs(args []string) []string {

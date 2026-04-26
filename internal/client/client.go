@@ -66,7 +66,7 @@ func tryDistributed(compilerPath string, compilerArgs []string, parsedArgs compi
 
 	// Step 2: submit to daemon.
 	outputFile := parsedArgs.OutputFile()
-	result, err := submitToDaemon(compilerPath, compilerArgs, ppResult, outputFile)
+	result, err := submitToDaemon(compilerPath, compilerArgs, ppResult, outputFile, parsedArgs.SourceFile())
 	if err != nil {
 		return 0, fmt.Errorf("daemon submission: %w", err)
 	}
@@ -101,6 +101,8 @@ type SubmitRequest struct {
 	PreprocessedSource []byte `json:"preprocessed_source"`
 	// OutputFile is the expected output .o path (for daemon reference only).
 	OutputFile string `json:"output_file"`
+	// SourcePath is the original source file path (before preprocessing).
+	SourcePath string `json:"source_path,omitempty"`
 }
 
 // SubmitResponse is the JSON response from /local/submit_task.
@@ -113,13 +115,14 @@ type SubmitResponse struct {
 	CacheHit bool `json:"cache_hit"`
 }
 
-func submitToDaemon(compilerPath string, compilerArgs []string, ppResult compiler.PreprocessResult, outputFile string) (*SubmitResponse, error) {
+func submitToDaemon(compilerPath string, compilerArgs []string, ppResult compiler.PreprocessResult, outputFile, sourcePath string) (*SubmitResponse, error) {
 	reqBody := SubmitRequest{
 		CompilerPath:       compilerPath,
 		Args:               compilerArgs,
 		Language:           ppResult.Language,
 		PreprocessedSource: ppResult.Source,
 		OutputFile:         outputFile,
+		SourcePath:         sourcePath,
 	}
 
 	data, err := json.Marshal(reqBody)

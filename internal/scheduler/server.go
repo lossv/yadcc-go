@@ -13,6 +13,7 @@ import (
 
 	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
+	"yadcc-go/internal/metrics"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -23,20 +24,22 @@ const workerHeartbeatTimeout = 30 * time.Second
 
 // workerEntry tracks a registered remote worker.
 type workerEntry struct {
-	id           string
-	location     string // "host:port" of the worker's gRPC endpoint
-	capacity     uint32
-	currentLoad  uint32
-	lastSeen     time.Time
-	environments []*pb.EnvironmentDesc
+	id              string
+	location        string // "host:port" of the worker's gRPC endpoint
+	capacity        uint32
+	currentLoad     uint32
+	isDedicated     bool
+	availableMemory uint64
+	lastSeen        time.Time
+	environments    []*pb.EnvironmentDesc
 }
 
 // taskGrant tracks an issued task grant.
 type taskGrant struct {
-	id         uint64
-	workerID   string
-	issuedAt   time.Time
-	keepAlive  time.Time
+	id        uint64
+	workerID  string
+	issuedAt  time.Time
+	keepAlive time.Time
 }
 
 // Server implements SchedulerServiceServer over gRPC, and also exposes a small
@@ -106,8 +109,13 @@ func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 	w.location = req.Location
 	w.capacity = req.Capacity
 	w.currentLoad = req.CurrentLoad
+	w.isDedicated = req.IsDedicated
+	w.availableMemory = req.AvailableMemoryBytes
 	w.lastSeen = time.Now()
 	w.environments = req.Environments
+
+	metrics.SchedulerHeartbeatsTotal.Inc()
+	metrics.SchedulerWorkersActive.Set(float64(len(s.workers)))
 
 	// Collect expired grant IDs to notify the worker.
 	var expired []uint64
@@ -165,7 +173,7 @@ func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartin
 	for {
 		var grants []*pb.StartingTaskGrant
 		for range want {
-			w := s.pickWorker(req.Environment)
+			w := s.pickWorker(req.Environment, req.RequesterLocation)
 			if w == nil {
 				break
 			}
@@ -184,6 +192,7 @@ func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartin
 		}
 
 		if len(grants) > 0 {
+			metrics.SchedulerGrantsActive.Set(float64(len(s.grants)))
 			return &pb.WaitForStartingTaskResponse{Grants: grants}, nil
 		}
 
@@ -229,16 +238,30 @@ func (s *Server) FreeTask(_ context.Context, req *pb.FreeTaskRequest) (*pb.FreeT
 			delete(s.grants, gid)
 		}
 	}
+	metrics.SchedulerGrantsActive.Set(float64(len(s.grants)))
 	s.cond.Broadcast()
 	return &pb.FreeTaskResponse{}, nil
 }
 
 // ---------- helpers ----------
 
-// pickWorker selects the least-loaded worker that supports the requested
-// environment.  Must be called with s.mu held.
-func (s *Server) pickWorker(env *pb.EnvironmentDesc) *workerEntry {
-	var best *workerEntry
+// pickWorker selects the best available worker for the given environment.
+//
+// Selection policy (matching C++ yadcc):
+//  1. Dedicated workers are preferred over user-mode workers.
+//  2. Among workers of equal priority, prefer the one with the most free
+//     capacity (capacity - currentLoad).
+//  3. Self-avoidance: a worker whose location matches requesterLocation is
+//     only used as a last resort (when no other worker has capacity).
+//
+// Must be called with s.mu held.
+func (s *Server) pickWorker(env *pb.EnvironmentDesc, requesterLocation string) *workerEntry {
+	const minAvailableMemoryBytes = 10 << 30 // 10 GiB
+
+	var bestDedicated, bestUser, bestSelf *workerEntry
+
+	score := func(w *workerEntry) uint32 { return w.capacity - w.currentLoad }
+
 	for _, w := range s.workers {
 		if w.currentLoad >= w.capacity {
 			continue
@@ -246,11 +269,37 @@ func (s *Server) pickWorker(env *pb.EnvironmentDesc) *workerEntry {
 		if env != nil && !workerSupportsEnv(w, env) {
 			continue
 		}
-		if best == nil || w.currentLoad < best.currentLoad {
-			best = w
+		// Skip workers with critically low memory.
+		if w.availableMemory > 0 && w.availableMemory < minAvailableMemoryBytes {
+			continue
+		}
+
+		// Self-avoidance bucket.
+		if requesterLocation != "" && w.location == requesterLocation {
+			if bestSelf == nil || score(w) > score(bestSelf) {
+				bestSelf = w
+			}
+			continue
+		}
+
+		if w.isDedicated {
+			if bestDedicated == nil || score(w) > score(bestDedicated) {
+				bestDedicated = w
+			}
+		} else {
+			if bestUser == nil || score(w) > score(bestUser) {
+				bestUser = w
+			}
 		}
 	}
-	return best
+
+	if bestDedicated != nil {
+		return bestDedicated
+	}
+	if bestUser != nil {
+		return bestUser
+	}
+	return bestSelf // last resort: assign to requester itself
 }
 
 // workerSupportsEnv checks whether the worker advertises the requested env.
@@ -313,6 +362,7 @@ func (s *Server) serveHTTP() {
 			"running_tasks": grants,
 		})
 	})
+	mux.Handle("/metrics", metrics.Handler())
 	slog.Info("scheduler: HTTP debug server listening", "addr", s.HTTPAddr)
 	_ = http.ListenAndServe(s.HTTPAddr, mux)
 }

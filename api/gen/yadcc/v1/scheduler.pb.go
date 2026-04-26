@@ -31,8 +31,11 @@ type HeartbeatRequest struct {
 	TotalMemoryBytes     uint64                 `protobuf:"varint,6,opt,name=total_memory_bytes,json=totalMemoryBytes,proto3" json:"total_memory_bytes,omitempty"`
 	AvailableMemoryBytes uint64                 `protobuf:"varint,7,opt,name=available_memory_bytes,json=availableMemoryBytes,proto3" json:"available_memory_bytes,omitempty"`
 	Environments         []*EnvironmentDesc     `protobuf:"bytes,8,rep,name=environments,proto3" json:"environments,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// is_dedicated indicates this daemon is running in dedicated (build-farm) mode.
+	// Dedicated workers are preferred over user-mode workers by the scheduler.
+	IsDedicated   bool `protobuf:"varint,9,opt,name=is_dedicated,json=isDedicated,proto3" json:"is_dedicated,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -121,6 +124,13 @@ func (x *HeartbeatRequest) GetEnvironments() []*EnvironmentDesc {
 	return nil
 }
 
+func (x *HeartbeatRequest) GetIsDedicated() bool {
+	if x != nil {
+		return x.IsDedicated
+	}
+	return false
+}
+
 type HeartbeatResponse struct {
 	state                  protoimpl.MessageState `protogen:"open.v1"`
 	AcceptableDaemonTokens []string               `protobuf:"bytes,1,rep,name=acceptable_daemon_tokens,json=acceptableDaemonTokens,proto3" json:"acceptable_daemon_tokens,omitempty"`
@@ -180,8 +190,12 @@ type WaitForStartingTaskRequest struct {
 	ImmediateRequests  uint32                 `protobuf:"varint,3,opt,name=immediate_requests,json=immediateRequests,proto3" json:"immediate_requests,omitempty"`
 	PrefetchRequests   uint32                 `protobuf:"varint,4,opt,name=prefetch_requests,json=prefetchRequests,proto3" json:"prefetch_requests,omitempty"`
 	MillisecondsToWait uint32                 `protobuf:"varint,5,opt,name=milliseconds_to_wait,json=millisecondsToWait,proto3" json:"milliseconds_to_wait,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// requester_location is the servant address ("host:port") of the requesting
+	// daemon.  The scheduler uses this for self-avoidance: it will not assign
+	// the requester as its own worker unless no other worker is available.
+	RequesterLocation string `protobuf:"bytes,6,opt,name=requester_location,json=requesterLocation,proto3" json:"requester_location,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *WaitForStartingTaskRequest) Reset() {
@@ -247,6 +261,13 @@ func (x *WaitForStartingTaskRequest) GetMillisecondsToWait() uint32 {
 		return x.MillisecondsToWait
 	}
 	return 0
+}
+
+func (x *WaitForStartingTaskRequest) GetRequesterLocation() string {
+	if x != nil {
+		return x.RequesterLocation
+	}
+	return ""
 }
 
 type StartingTaskGrant struct {
@@ -533,7 +554,7 @@ var File_yadcc_v1_scheduler_proto protoreflect.FileDescriptor
 
 const file_yadcc_v1_scheduler_proto_rawDesc = "" +
 	"\n" +
-	"\x18yadcc/v1/scheduler.proto\x12\byadcc.v1\x1a\x15yadcc/v1/common.proto\"\xc0\x02\n" +
+	"\x18yadcc/v1/scheduler.proto\x12\byadcc.v1\x1a\x15yadcc/v1/common.proto\"\xe3\x02\n" +
 	"\x10HeartbeatRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1a\n" +
 	"\blocation\x18\x02 \x01(\tR\blocation\x12\x18\n" +
@@ -542,16 +563,18 @@ const file_yadcc_v1_scheduler_proto_rawDesc = "" +
 	"\fcurrent_load\x18\x05 \x01(\rR\vcurrentLoad\x12,\n" +
 	"\x12total_memory_bytes\x18\x06 \x01(\x04R\x10totalMemoryBytes\x124\n" +
 	"\x16available_memory_bytes\x18\a \x01(\x04R\x14availableMemoryBytes\x12=\n" +
-	"\fenvironments\x18\b \x03(\v2\x19.yadcc.v1.EnvironmentDescR\fenvironments\"\x82\x01\n" +
+	"\fenvironments\x18\b \x03(\v2\x19.yadcc.v1.EnvironmentDescR\fenvironments\x12!\n" +
+	"\fis_dedicated\x18\t \x01(\bR\visDedicated\"\x82\x01\n" +
 	"\x11HeartbeatResponse\x128\n" +
 	"\x18acceptable_daemon_tokens\x18\x01 \x03(\tR\x16acceptableDaemonTokens\x123\n" +
-	"\x16expired_task_grant_ids\x18\x02 \x03(\x04R\x13expiredTaskGrantIds\"\xfd\x01\n" +
+	"\x16expired_task_grant_ids\x18\x02 \x03(\x04R\x13expiredTaskGrantIds\"\xac\x02\n" +
 	"\x1aWaitForStartingTaskRequest\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12;\n" +
 	"\venvironment\x18\x02 \x01(\v2\x19.yadcc.v1.EnvironmentDescR\venvironment\x12-\n" +
 	"\x12immediate_requests\x18\x03 \x01(\rR\x11immediateRequests\x12+\n" +
 	"\x11prefetch_requests\x18\x04 \x01(\rR\x10prefetchRequests\x120\n" +
-	"\x14milliseconds_to_wait\x18\x05 \x01(\rR\x12millisecondsToWait\"b\n" +
+	"\x14milliseconds_to_wait\x18\x05 \x01(\rR\x12millisecondsToWait\x12-\n" +
+	"\x12requester_location\x18\x06 \x01(\tR\x11requesterLocation\"b\n" +
 	"\x11StartingTaskGrant\x12\"\n" +
 	"\rtask_grant_id\x18\x01 \x01(\x04R\vtaskGrantId\x12)\n" +
 	"\x10servant_location\x18\x02 \x01(\tR\x0fservantLocation\"R\n" +

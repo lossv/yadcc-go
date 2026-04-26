@@ -22,6 +22,9 @@ message HeartbeatRequest {
   uint64 total_memory_bytes = 6;
   uint64 available_memory_bytes = 7;
   repeated EnvironmentDesc environments = 8;
+  // is_dedicated indicates this daemon is running in dedicated (build-farm) mode.
+  // Dedicated workers are preferred over user-mode workers by the scheduler.
+  bool is_dedicated = 9;
 }
 
 message HeartbeatResponse {
@@ -35,6 +38,10 @@ message WaitForStartingTaskRequest {
   uint32 immediate_requests = 3;
   uint32 prefetch_requests = 4;
   uint32 milliseconds_to_wait = 5;
+  // requester_location is the servant address ("host:port") of the requesting
+  // daemon.  The scheduler uses this for self-avoidance: it will not assign
+  // the requester as its own worker unless no other worker is available.
+  string requester_location = 6;
 }
 
 message StartingTaskGrant {

@@ -72,7 +72,7 @@ func TestSubmitToDaemon_success(t *testing.T) {
 	t.Cleanup(func() { os.Unsetenv("YADCC_DAEMON_ADDR") })
 
 	pp := compiler.PreprocessResult{Language: "c", Source: []byte("int main(){}")}
-	got, err := submitToDaemon("/usr/bin/gcc", []string{"-c", "foo.c"}, pp, "foo.o")
+	got, err := submitToDaemon("/usr/bin/gcc", []string{"-c", "foo.c"}, pp, "foo.o", "")
 	if err != nil {
 		t.Fatalf("submitToDaemon error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestSubmitToDaemon_nonOKStatus(t *testing.T) {
 	t.Cleanup(func() { os.Unsetenv("YADCC_DAEMON_ADDR") })
 
 	pp := compiler.PreprocessResult{Language: "c", Source: []byte("int x;")}
-	_, err := submitToDaemon("/usr/bin/gcc", nil, pp, "out.o")
+	_, err := submitToDaemon("/usr/bin/gcc", nil, pp, "out.o", "")
 	if err == nil {
 		t.Fatal("expected error on non-200 response")
 	}
@@ -114,7 +114,7 @@ func TestSubmitToDaemon_badJSON(t *testing.T) {
 	t.Cleanup(func() { os.Unsetenv("YADCC_DAEMON_ADDR") })
 
 	pp := compiler.PreprocessResult{Language: "c", Source: []byte("int x;")}
-	_, err := submitToDaemon("/usr/bin/gcc", nil, pp, "out.o")
+	_, err := submitToDaemon("/usr/bin/gcc", nil, pp, "out.o", "")
 	if err == nil {
 		t.Fatal("expected error on malformed JSON response")
 	}
