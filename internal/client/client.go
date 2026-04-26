@@ -16,10 +16,17 @@ import (
 	"yadcc-go/internal/platform"
 )
 
-const (
-	daemonAddr    = "http://127.0.0.1:8334"
-	submitTimeout = 60 * time.Second
-)
+const submitTimeout = 60 * time.Second
+
+// daemonBaseURL returns the locald HTTP base URL.  The environment variable
+// YADCC_DAEMON_ADDR overrides the default so tests and non-standard deployments
+// can point at a different port without recompiling.
+func daemonBaseURL() string {
+	if v := os.Getenv("YADCC_DAEMON_ADDR"); v != "" {
+		return v
+	}
+	return "http://127.0.0.1:8334"
+}
 
 func Run(argv []string) int {
 	if len(argv) <= 1 {
@@ -121,7 +128,7 @@ func submitToDaemon(compilerPath string, compilerArgs []string, ppResult compile
 	}
 
 	client := &http.Client{Timeout: submitTimeout}
-	resp, err := client.Post(daemonAddr+"/local/submit_task", "application/json", bytes.NewReader(data))
+	resp, err := client.Post(daemonBaseURL()+"/local/submit_task", "application/json", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("http post: %w", err)
 	}
