@@ -9,7 +9,8 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "0.0.0.0:8337", "cache service listen address")
+	httpAddr := flag.String("addr", "0.0.0.0:8339", "cache service HTTP listen address")
+	grpcAddr := flag.String("grpc-addr", "0.0.0.0:8338", "cache service gRPC listen address")
 	engine := flag.String("engine", "memory", "cache backend: memory or disk")
 	diskDir := flag.String("disk-dir", "tmp/cache", "disk cache directory when -engine=disk")
 	flag.Parse()
@@ -20,9 +21,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("starting yadcc-cache", "addr", *addr)
-	if err := (cache.Server{Addr: *addr, Store: store}).ListenAndServe(); err != nil {
-		slog.Error("cache stopped", "error", err)
+	// Start the gRPC server in the background.
+	go func() {
+		slog.Info("starting yadcc-cache gRPC", "addr", *grpcAddr)
+		if err := (&cache.GRPCServer{GRPCAddr: *grpcAddr, Store: store}).ListenAndServe(); err != nil {
+			slog.Error("cache gRPC stopped", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// HTTP server runs in the foreground.
+	slog.Info("starting yadcc-cache HTTP", "addr", *httpAddr)
+	if err := (cache.Server{Addr: *httpAddr, Store: store}).ListenAndServe(); err != nil {
+		slog.Error("cache HTTP stopped", "error", err)
 		os.Exit(1)
 	}
 }

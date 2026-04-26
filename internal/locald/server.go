@@ -17,6 +17,8 @@ import (
 	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
 	"yadcc-go/internal/cache"
+	"yadcc-go/internal/compiler"
+	"yadcc-go/internal/compress"
 	"yadcc-go/internal/taskgroup"
 
 	"google.golang.org/grpc"
@@ -194,12 +196,16 @@ func (s *Server) tryRemoteGRPC(req SubmitRequest) (compileResult, error) {
 	queueCtx, queueCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer queueCancel()
 
+	compilerDigest, _ := compiler.Digest(req.CompilerPath)
+
 	queueResp, err := workerClient.QueueCxxCompilationTask(queueCtx, &pb.QueueCxxCompilationTaskRequest{
-		Token:                  "locald",
-		TaskGrantId:            grant.TaskGrantId,
-		Environment:            &pb.EnvironmentDesc{},
+		Token:       "locald",
+		TaskGrantId: grant.TaskGrantId,
+		Environment: &pb.EnvironmentDesc{
+			CompilerDigest: compilerDigest,
+		},
 		CompilerArguments:      req.Args,
-		ZstdPreprocessedSource: req.PreprocessedSource,
+		ZstdPreprocessedSource: compress.Compress(req.PreprocessedSource),
 	})
 	if err != nil {
 		s.freeGrant(grant.TaskGrantId)
@@ -275,7 +281,7 @@ func (s *Server) localCompile(req SubmitRequest) (compileResult, error) {
 	}
 	defer removeFile(tmpFile)
 
-	args := buildLocalArgs(req.Args, tmpFile, req.OutputFile)
+	args := buildLocalArgs(req.Args, req.Language, tmpFile, req.OutputFile)
 
 	var outBuf, errBuf bytes.Buffer
 	cmd := exec.Command(req.CompilerPath, args...)
@@ -304,14 +310,58 @@ func (s *Server) localCompile(req SubmitRequest) (compileResult, error) {
 	}, nil
 }
 
+// buildCacheKey produces a deterministic cache key for a compile request.
+//
+// It hashes:
+//   - The compiler binary digest (so different compilers never share cache entries).
+//   - The source language.
+//   - Normalized compiler arguments (debug/path/dependency flags that affect
+//     reproducibility are stripped; only flags that influence the object file
+//     content are kept).
+//   - The SHA-256 of the preprocessed source.
+//
+// A best-effort approach is used for the compiler digest: if the binary cannot
+// be hashed (e.g. not found), the path itself is used as a fallback so that
+// compilation can still proceed — just without cross-compiler cache sharing.
 func buildCacheKey(req SubmitRequest) string {
+	compilerDigest, err := compiler.Digest(req.CompilerPath)
+	if err != nil {
+		slog.Warn("locald: could not hash compiler binary, using path as fallback",
+			"path", req.CompilerPath, "error", err)
+		compilerDigest = req.CompilerPath
+	}
+
 	h := sha256.New()
-	fmt.Fprintf(h, "source:%x\n", sha256.Sum256(req.PreprocessedSource))
+	fmt.Fprintf(h, "compiler:%s\n", compilerDigest)
 	fmt.Fprintf(h, "lang:%s\n", req.Language)
-	for _, a := range req.Args {
+	for _, a := range normalizeArgs(req.Args) {
 		fmt.Fprintf(h, "arg:%s\n", a)
 	}
+	fmt.Fprintf(h, "source:%x\n", sha256.Sum256(req.PreprocessedSource))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// normalizeArgs removes flags that do not affect the compiled object file
+// content so that the cache key is stable across invocations with differing
+// -o paths, dependency-file names, or debug-prefix-map values.
+func normalizeArgs(args []string) []string {
+	skipNext := false
+	var out []string
+	for _, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch a {
+		case "-o", "-MF", "-MT", "-MQ":
+			skipNext = true
+		case "-MD", "-MMD", "-MP", "-MG":
+			// drop
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

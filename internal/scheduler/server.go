@@ -51,6 +51,7 @@ type Server struct {
 	HTTPAddr string
 
 	mu      sync.Mutex
+	cond    *sync.Cond // broadcast when worker state changes
 	workers map[string]*workerEntry
 	grants  map[uint64]*taskGrant
 	nextID  atomic.Uint64
@@ -59,6 +60,7 @@ type Server struct {
 // ListenAndServe starts both the gRPC server and (if HTTPAddr set) the HTTP
 // debug server.  It blocks until the gRPC server stops.
 func (s *Server) ListenAndServe() error {
+	s.cond = sync.NewCond(&s.mu)
 	s.mu.Lock()
 	s.workers = make(map[string]*workerEntry)
 	s.grants = make(map[uint64]*taskGrant)
@@ -108,45 +110,84 @@ func (s *Server) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.Hea
 		}
 	}
 
+	// Wake any WaitForStartingTask callers that may now be satisfiable.
+	s.cond.Broadcast()
+
 	return &pb.HeartbeatResponse{
 		ExpiredTaskGrantIds: expired,
 	}, nil
 }
 
 // WaitForStartingTask allocates task grants for a requester daemon.
-func (s *Server) WaitForStartingTask(_ context.Context, req *pb.WaitForStartingTaskRequest) (*pb.WaitForStartingTaskResponse, error) {
+//
+// If no worker is immediately available it waits up to milliseconds_to_wait
+// milliseconds (honouring the gRPC context deadline) for a worker to free up,
+// then returns ResourceExhausted if still none available.
+func (s *Server) WaitForStartingTask(ctx context.Context, req *pb.WaitForStartingTaskRequest) (*pb.WaitForStartingTaskResponse, error) {
 	want := int(req.ImmediateRequests)
 	if want <= 0 {
 		want = 1
 	}
 
+	waitMs := req.MillisecondsToWait
+	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
+
+	// Use a separate goroutine to broadcast the cond when the context or
+	// deadline fires, so we don't block forever inside cond.Wait.
+	stopWake := make(chan struct{})
+	go func() {
+		var d <-chan time.Time
+		if waitMs > 0 {
+			d = time.After(time.Duration(waitMs) * time.Millisecond)
+		}
+		select {
+		case <-stopWake:
+		case <-ctx.Done():
+			s.cond.Broadcast()
+		case <-d:
+			s.cond.Broadcast()
+		}
+	}()
+	defer close(stopWake)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var grants []*pb.StartingTaskGrant
-	for range want {
-		w := s.pickWorker(req.Environment)
-		if w == nil {
-			break
+	for {
+		var grants []*pb.StartingTaskGrant
+		for range want {
+			w := s.pickWorker(req.Environment)
+			if w == nil {
+				break
+			}
+			w.currentLoad++
+			id := s.nextID.Add(1)
+			s.grants[id] = &taskGrant{
+				id:        id,
+				workerID:  w.id,
+				issuedAt:  time.Now(),
+				keepAlive: time.Now(),
+			}
+			grants = append(grants, &pb.StartingTaskGrant{
+				TaskGrantId:     id,
+				ServantLocation: w.location,
+			})
 		}
-		w.currentLoad++
-		id := s.nextID.Add(1)
-		s.grants[id] = &taskGrant{
-			id:        id,
-			workerID:  w.id,
-			issuedAt:  time.Now(),
-			keepAlive: time.Now(),
-		}
-		grants = append(grants, &pb.StartingTaskGrant{
-			TaskGrantId:     id,
-			ServantLocation: w.location,
-		})
-	}
 
-	if len(grants) == 0 {
-		return nil, status.Error(codes.ResourceExhausted, "no available workers")
+		if len(grants) > 0 {
+			return &pb.WaitForStartingTaskResponse{Grants: grants}, nil
+		}
+
+		// Check if we should stop waiting.
+		if ctx.Err() != nil {
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+		if waitMs == 0 || time.Now().After(deadline) {
+			return nil, status.Error(codes.ResourceExhausted, "no available workers")
+		}
+
+		s.cond.Wait() // releases s.mu, reacquires on wake
 	}
-	return &pb.WaitForStartingTaskResponse{Grants: grants}, nil
 }
 
 // KeepTaskAlive refreshes the keep-alive timestamp for the given grants.
@@ -177,6 +218,7 @@ func (s *Server) FreeTask(_ context.Context, req *pb.FreeTaskRequest) (*pb.FreeT
 			delete(s.grants, gid)
 		}
 	}
+	s.cond.Broadcast()
 	return &pb.FreeTaskResponse{}, nil
 }
 
@@ -216,7 +258,8 @@ func workerSupportsEnv(w *workerEntry, env *pb.EnvironmentDesc) bool {
 	return false
 }
 
-// evictLoop removes workers whose heartbeat has timed out.
+// evictLoop removes workers whose heartbeat has timed out and cleans up their
+// associated grants.
 func (s *Server) evictLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -226,9 +269,16 @@ func (s *Server) evictLoop() {
 		for id, w := range s.workers {
 			if now.Sub(w.lastSeen) > workerHeartbeatTimeout {
 				slog.Info("scheduler: evicting stale worker", "id", id)
+				// Clean up any grants associated with this worker.
+				for gid, g := range s.grants {
+					if g.workerID == id {
+						delete(s.grants, gid)
+					}
+				}
 				delete(s.workers, id)
 			}
 		}
+		s.cond.Broadcast()
 		s.mu.Unlock()
 	}
 }

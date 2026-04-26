@@ -15,6 +15,7 @@ import (
 
 	pb "yadcc-go/api/gen/yadcc/v1"
 	"yadcc-go/internal/buildinfo"
+	"yadcc-go/internal/compress"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -153,27 +154,17 @@ func (s *Server) FreeRemoteTask(_ context.Context, req *pb.FreeRemoteTaskRequest
 // ---------- compile logic ----------
 
 func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForCompilationOutputResponse {
-	env := req.Environment
-	lang := "c"
-	if env != nil && (env.CompilerKind == "clang" || env.CompilerKind == "gcc") {
-		// language info not in EnvironmentDesc — infer from source extension later
-	}
-	// Detect language from compiler_arguments.
-	for _, a := range req.CompilerArguments {
-		if a == "-x" {
-			// Next arg is the language; handled in loop below.
-		}
-	}
-	for i, a := range req.CompilerArguments {
-		if a == "-x" && i+1 < len(req.CompilerArguments) {
-			lang = req.CompilerArguments[i+1]
-			break
-		}
-	}
+	lang := inferLang(req.CompilerArguments)
 
 	ext := ".i"
-	if strings.Contains(lang, "++") || strings.Contains(lang, "c++") {
+	if strings.Contains(lang, "++") {
 		ext = ".ii"
+	}
+
+	// Decompress the preprocessed source.
+	srcBytes, err := compress.Decompress(req.ZstdPreprocessedSource)
+	if err != nil {
+		return errResponse("decompress source: " + err.Error())
 	}
 
 	// Write preprocessed source to temp file.
@@ -184,7 +175,7 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 	tmpSrcPath := tmpSrc.Name()
 	defer os.Remove(tmpSrcPath)
 
-	if _, err := tmpSrc.Write(req.ZstdPreprocessedSource); err != nil {
+	if _, err := tmpSrc.Write(srcBytes); err != nil {
 		tmpSrc.Close()
 		return errResponse("write temp source: " + err.Error())
 	}
@@ -241,8 +232,38 @@ func (s *Server) runCompile(req *pb.QueueCxxCompilationTaskRequest) *pb.WaitForC
 	return resp
 }
 
-// buildCompileArgs adapts original args for real compilation from preprocessed src.
+// inferLang returns the language value from a -x flag in args, or "" if absent.
+func inferLang(args []string) string {
+	for i, a := range args {
+		if a == "-x" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// preprocessedLangFlag converts a source language to the preprocessed variant
+// expected by gcc/clang when compiling an already-preprocessed file.
+//
+//	"c"   / ""           → "cpp-output"
+//	"c++" / "c++-cpp-…"  → "c++-cpp-output"
+func preprocessedLangFlag(lang string) string {
+	if strings.Contains(lang, "++") {
+		return "c++-cpp-output"
+	}
+	return "cpp-output"
+}
+
+// buildCompileArgs adapts original compiler args for compiling a preprocessed
+// source file.  It:
+//   - Drops input file tokens (replaced by tmpSrc).
+//   - Replaces -o with tmpOut.
+//   - Drops preprocessing-only / dependency flags.
+//   - Drops any existing -x (replaced by the correct preprocessed-language value).
+//   - Prepends -x <cpp-output|c++-cpp-output>.
 func buildCompileArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
+	lang := inferLang(originalArgs)
+
 	skipNext := false
 	hasOutput := false
 	var args []string
@@ -255,29 +276,37 @@ func buildCompileArgs(originalArgs []string, tmpSrc, tmpOut string) []string {
 		if !strings.HasPrefix(a, "-") {
 			continue // input file — replaced by tmpSrc
 		}
-		if a == "-o" {
+		switch a {
+		case "-o":
 			if i+1 < len(originalArgs) {
 				skipNext = true
 			}
 			args = append(args, "-o", tmpOut)
 			hasOutput = true
-			continue
-		}
-		switch a {
+		case "-x":
+			// drop; we prepend the correct preprocessed-language value below
+			if i+1 < len(originalArgs) {
+				skipNext = true
+			}
 		case "-E", "-fdirectives-only", "-MD", "-MMD", "-MP", "-MG":
-			continue
+			// drop
 		case "-MF", "-MT", "-MQ":
-			skipNext = true
-			continue
+			skipNext = true // drop flag + value
+		default:
+			args = append(args, a)
 		}
-		args = append(args, a)
 	}
 
 	if !hasOutput {
 		args = append(args, "-o", tmpOut)
 	}
-	args = append(args, tmpSrc)
-	return args
+
+	// Prepend -x <preprocessed-lang> then append the source file.
+	result := make([]string, 0, len(args)+3)
+	result = append(result, "-x", preprocessedLangFlag(lang))
+	result = append(result, args...)
+	result = append(result, tmpSrc)
+	return result
 }
 
 func errResponse(msg string) *pb.WaitForCompilationOutputResponse {
